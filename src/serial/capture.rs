@@ -43,7 +43,7 @@ pub struct CaptureChunk {
     pub elapsed_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureConfig {
     pub timeout_ms: u64,
     pub max_bytes: usize,
@@ -88,7 +88,7 @@ impl CaptureConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureReport {
     pub data: Vec<u8>,
     pub chunks: Vec<CaptureChunk>,

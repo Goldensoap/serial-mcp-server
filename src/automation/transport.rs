@@ -4,7 +4,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::{AutomationError, AutomationResult};
-use crate::serial::{LocalSerialError, SerialConnection};
+use crate::broker::BrokerSerialConnection;
+use crate::serial::LocalSerialError;
 
 #[async_trait]
 pub trait MacroTransport: Send {
@@ -13,11 +14,11 @@ pub trait MacroTransport: Send {
 }
 
 pub struct SerialMacroTransport {
-    connection: Arc<SerialConnection>,
+    connection: Arc<BrokerSerialConnection>,
 }
 
 impl SerialMacroTransport {
-    pub fn new(connection: Arc<SerialConnection>) -> Self {
+    pub fn new(connection: Arc<BrokerSerialConnection>) -> Self {
         Self { connection }
     }
 }

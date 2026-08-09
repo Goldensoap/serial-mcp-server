@@ -1,3 +1,4 @@
+use crate::events::{publish, SerialEvent};
 use serde::{Deserialize, Serialize};
 use serialport::{available_ports, SerialPortType};
 
@@ -14,7 +15,7 @@ impl PortInfo {
     pub fn list_ports() -> Result<Vec<PortInfo>, serialport::Error> {
         let ports = available_ports()?;
 
-        Ok(ports
+        let ports = ports
             .into_iter()
             .map(|port| {
                 let hardware_id = match &port.port_type {
@@ -33,7 +34,20 @@ impl PortInfo {
                     available: true,
                 }
             })
-            .collect())
+            .collect::<Vec<_>>();
+
+        publish(
+            SerialEvent::new(
+                "ports.scanned",
+                format!("Found {} serial ports", ports.len()),
+            )
+            .details(serde_json::json!({
+                "count": ports.len(),
+                "ports": ports.iter().map(|port| &port.name).collect::<Vec<_>>(),
+            })),
+        );
+
+        Ok(ports)
     }
 }
 

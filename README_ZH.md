@@ -4,8 +4,9 @@
 [![RMCP](https://img.shields.io/badge/RMCP-0.3.2-blue.svg)](https://github.com/modelcontextprotocol/rust-sdk)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-`serial-mcp-server` 为 AI 工作流提供串口访问能力，包含两种使用方式：
+`serial-mcp-server` 为 AI 工作流提供串口访问能力，包含三种使用方式：
 
+- 基于 Tauri 2 的桌面 GUI，提供串口控制台和实时 AI 活动视图。
 - 面向 MCP 客户端的 stdio MCP 服务器。
 - 面向脚本、CI 和 agent skill 的直接 CLI，不需要先配置 MCP。
 
@@ -46,6 +47,35 @@ AI agent 可以通过本 README、仓库内置的 `skills/serial-debug` skill、
 - Rust 1.74 或更新版本。
 - 执行硬件操作时需要串口设备或 USB 转串口适配器。
 - 系统需要具备对应串口驱动和端口访问权限。
+
+## Tauri 2 桌面 GUI
+
+GUI 位于 `gui/`。它不是一个独立的串口实现：GUI、MCP 和 CLI 都连接本机串口代理，代理是唯一持有物理串口的操作实例。
+
+```text
+GUI ─┐
+MCP ─┼─ TCP 127.0.0.1:47832 ─ 单一串口代理 ─ 物理串口
+CLI ─┘                         └─ 实时事件 ─ GUI
+```
+
+建议先启动 GUI，让它成为长生命周期代理宿主：
+
+```bash
+cd gui
+npm install
+npm run tauri dev
+```
+
+共享行为：
+
+- GUI 打开端口后，MCP 再以相同端口和参数调用 `open`，会得到同一个 `connection_id`，不会重复打开设备。
+- MCP 可用 `list_connections` 发现 GUI 或 CLI 已建立的连接。
+- CLI 的按端口命令会复用相同配置的已打开连接。
+- 客户端进程退出不会关闭共享连接；只有显式 `close` 或代理宿主退出才会释放串口。
+- 代理只读取物理 RX 一次，并通过有界缓冲提供给 MCP/CLI；GUI 从事件流实时显示 RX，不会轮询并抢走 AI 要读取的数据。
+- TX、RX、连接与控制线事件带来源和 PID，GUI 可区分 GUI、MCP、CLI 和设备活动。
+
+本机代理默认地址为 `127.0.0.1:47832`，可用 `SERIAL_MCP_BROKER_ADDR` 修改。事件 UDP 地址默认为 `127.0.0.1:47831`，可用 `SERIAL_MCP_EVENT_ADDR` 修改。详细开发与验收步骤见 [`gui/README.md`](gui/README.md)。
 
 ## 从源码安装
 
@@ -194,6 +224,7 @@ Windows 示例：
 | 工具 | 用途 |
 | --- | --- |
 | `list_ports` | 发现可用串口。 |
+| `list_connections` | 列出 GUI、MCP 或 CLI 创建的共享连接。 |
 | `open` | 打开串口连接。 |
 | `write` | 向已打开连接写入 UTF-8、hex 或 base64 数据。 |
 | `read` | 从已打开连接读取数据，支持单次超时读取或有边界的采集窗口。 |

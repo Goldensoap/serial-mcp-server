@@ -9,8 +9,9 @@ use uuid::Uuid;
 
 use super::capture::{capture_with_reader, CaptureConfig, CaptureReader, CaptureReport};
 use super::error::SerialError;
+use crate::events::{publish, SerialEvent};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataBits {
     #[serde(rename = "5")]
     Five,
@@ -33,7 +34,7 @@ impl From<DataBits> for serialport::DataBits {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopBits {
     #[serde(rename = "1")]
     One,
@@ -50,7 +51,7 @@ impl From<StopBits> for serialport::StopBits {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Parity {
     None,
@@ -68,7 +69,7 @@ impl From<Parity> for serialport::Parity {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FlowControl {
     None,
@@ -86,7 +87,7 @@ impl From<FlowControl> for serialport::FlowControl {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     pub port: String,
     pub baud_rate: u32,
@@ -113,7 +114,7 @@ fn default_flow_control() -> FlowControl {
     FlowControl::None
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionStatus {
     pub id: String,
     pub port: String,
@@ -153,18 +154,57 @@ impl SerialConnection {
             .flow_control(config.flow_control.into());
 
         // Open the port
-        let stream = builder
-            .open_native_async()
-            .map_err(|e| SerialError::ConnectionFailed(format!("{}: {}", config.port, e)))?;
+        let stream = match builder.open_native_async() {
+            Ok(stream) => stream,
+            Err(error) => {
+                publish(
+                    SerialEvent::new(
+                        "connection.error",
+                        format!("Failed to open {}: {error}", config.port),
+                    )
+                    .port(config.port.clone())
+                    .details(serde_json::json!({
+                        "operation": "open",
+                        "baud_rate": config.baud_rate,
+                        "error": error.to_string(),
+                    })),
+                );
+                return Err(SerialError::ConnectionFailed(format!(
+                    "{}: {}",
+                    config.port, error
+                )));
+            }
+        };
 
-        Ok(Self {
+        let connection = Self {
             id: Uuid::new_v4().to_string(),
             config,
             stream: Arc::new(Mutex::new(stream)),
             created_at: Utc::now(),
             bytes_sent: Arc::new(Mutex::new(0)),
             bytes_received: Arc::new(Mutex::new(0)),
-        })
+        };
+
+        publish(
+            SerialEvent::new(
+                "connection.opened",
+                format!(
+                    "Opened {} at {} baud",
+                    connection.config.port, connection.config.baud_rate
+                ),
+            )
+            .connection(connection.id.clone())
+            .port(connection.config.port.clone())
+            .details(serde_json::json!({
+                "baud_rate": connection.config.baud_rate,
+                "data_bits": connection.config.data_bits,
+                "stop_bits": connection.config.stop_bits,
+                "parity": connection.config.parity,
+                "flow_control": connection.config.flow_control,
+            })),
+        );
+
+        Ok(connection)
     }
 
     pub fn id(&self) -> &str {
@@ -181,6 +221,14 @@ impl SerialConnection {
         let mut sent = self.bytes_sent.lock().await;
         *sent += written as u64;
 
+        publish(
+            SerialEvent::new("serial.tx", format!("Sent {written} bytes"))
+                .connection(self.id.clone())
+                .port(self.config.port.clone())
+                .direction("tx")
+                .data(&data[..written]),
+        );
+
         Ok(written)
     }
 
@@ -188,6 +236,26 @@ impl SerialConnection {
         &self,
         buffer: &mut [u8],
         timeout_ms: Option<u64>,
+    ) -> Result<usize, SerialError> {
+        self.read_inner(buffer, timeout_ms, true).await
+    }
+
+    /// Read without publishing an RX event. The shared broker uses this for
+    /// its single background reader and publishes a device event after the
+    /// bytes have been placed in the shared receive buffer.
+    pub(crate) async fn read_unobserved(
+        &self,
+        buffer: &mut [u8],
+        timeout_ms: Option<u64>,
+    ) -> Result<usize, SerialError> {
+        self.read_inner(buffer, timeout_ms, false).await
+    }
+
+    async fn read_inner(
+        &self,
+        buffer: &mut [u8],
+        timeout_ms: Option<u64>,
+        publish_event: bool,
     ) -> Result<usize, SerialError> {
         use tokio::io::AsyncReadExt;
 
@@ -206,6 +274,16 @@ impl SerialConnection {
 
         let mut received = self.bytes_received.lock().await;
         *received += bytes_read as u64;
+
+        if publish_event && bytes_read > 0 {
+            publish(
+                SerialEvent::new("serial.rx", format!("Received {bytes_read} bytes"))
+                    .connection(self.id.clone())
+                    .port(self.config.port.clone())
+                    .direction("rx")
+                    .data(&buffer[..bytes_read]),
+            );
+        }
 
         Ok(bytes_read)
     }
@@ -240,6 +318,25 @@ impl SerialConnection {
         let mut received = self.bytes_received.lock().await;
         *received += report.bytes_read() as u64;
 
+        if report.bytes_read() > 0 {
+            publish(
+                SerialEvent::new(
+                    "serial.rx",
+                    format!("Captured {} bytes", report.bytes_read()),
+                )
+                .connection(self.id.clone())
+                .port(self.config.port.clone())
+                .direction("rx")
+                .data(&report.data)
+                .details(serde_json::json!({
+                    "capture": true,
+                    "elapsed_ms": report.elapsed_ms,
+                    "completion_reason": &report.completion_reason,
+                    "chunks": &report.chunks,
+                })),
+            );
+        }
+
         Ok(report)
     }
 
@@ -263,6 +360,15 @@ impl SerialConnection {
         use serialport::SerialPort;
         let mut stream = self.stream.lock().await;
         stream.write_request_to_send(level)?;
+        publish(
+            SerialEvent::new(
+                "control.changed",
+                format!("RTS set {}", if level { "high" } else { "low" }),
+            )
+            .connection(self.id.clone())
+            .port(self.config.port.clone())
+            .details(serde_json::json!({ "rts": level })),
+        );
         Ok(())
     }
 
@@ -270,6 +376,15 @@ impl SerialConnection {
         use serialport::SerialPort;
         let mut stream = self.stream.lock().await;
         stream.write_data_terminal_ready(level)?;
+        publish(
+            SerialEvent::new(
+                "control.changed",
+                format!("DTR set {}", if level { "high" } else { "low" }),
+            )
+            .connection(self.id.clone())
+            .port(self.config.port.clone())
+            .details(serde_json::json!({ "dtr": level })),
+        );
         Ok(())
     }
 
@@ -291,5 +406,15 @@ impl SerialConnection {
         }
 
         Ok(())
+    }
+}
+
+impl Drop for SerialConnection {
+    fn drop(&mut self) {
+        publish(
+            SerialEvent::new("connection.closed", format!("Closed {}", self.config.port))
+                .connection(self.id.clone())
+                .port(self.config.port.clone()),
+        );
     }
 }

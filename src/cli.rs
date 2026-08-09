@@ -2,6 +2,7 @@ use crate::automation::{
     plan_target, validate_pack, MacroExecutor, MacroPack, MacroTarget, SerialMacroTransport,
     SimulatedMacroTransport,
 };
+use crate::broker::{BrokerConnectionManager, BrokerSerialConnection};
 use crate::config::{
     CliDataFormat, Command, ControlLineLevel, MacroCommand, MacroFileCommand, MacroPlanCommand,
     MacroRunCommand, OptionalSerialPortArgs, ReadCommand, SerialPortArgs, SetControlLinesCommand,
@@ -10,8 +11,7 @@ use crate::config::{
 use crate::error::{Result, SerialError};
 use crate::serial::{
     CaptureChunk, CaptureCompletionReason, CaptureConfig, CaptureReport, CaptureStartTrigger,
-    ConnectionConfig, DataBits, FlowControl, LocalSerialError, Parity, PortInfo, SerialConnection,
-    StopBits,
+    ConnectionConfig, DataBits, FlowControl, LocalSerialError, Parity, PortInfo, StopBits,
 };
 use crate::utils::{DataConverter, DataFormat};
 use crate::Config;
@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 pub async fn run(command: Command, config: &Config) -> Result<()> {
     match command {
-        Command::ListPorts(args) => list_ports(args.json),
+        Command::ListPorts(args) => list_ports(args.json).await,
         Command::Probe(args) => probe(args, config).await,
         Command::Write(args) => write(args, config).await,
         Command::Read(args) => read(args, config).await,
@@ -158,7 +158,7 @@ async fn macro_run(args: MacroRunCommand, config: &Config) -> Result<()> {
     }
 
     let connection_config = macro_connection_config(&args.serial, config)?;
-    let connection = Arc::new(open_connection(connection_config).await?);
+    let connection = open_connection(connection_config).await?;
     let report = MacroExecutor::real()
         .run(plan, SerialMacroTransport::new(connection))
         .await?;
@@ -190,8 +190,11 @@ fn macro_target(macro_name: Option<String>, assembly: Option<String>) -> Result<
     }
 }
 
-fn list_ports(json: bool) -> Result<()> {
-    let ports = PortInfo::list_ports()?;
+async fn list_ports(json: bool) -> Result<()> {
+    let ports = BrokerConnectionManager::new()
+        .list_ports()
+        .await
+        .map_err(map_serial_error)?;
     if json {
         print_json(&PortsOutput { ports })?;
         return Ok(());
@@ -216,7 +219,7 @@ async fn probe(args: SerialPortArgs, app_config: &Config) -> Result<()> {
     let json = args.json;
     let config = connection_config(&args, app_config)?;
     let connection = open_connection(config.clone()).await?;
-    let status = connection.status().await;
+    let status = connection.status().await.map_err(map_serial_error)?;
     let output = ProbeOutput {
         port: config.port,
         baud_rate: config.baud_rate,
@@ -363,7 +366,7 @@ async fn set_control_lines(args: SetControlLinesCommand, app_config: &Config) ->
 }
 
 async fn read_from_connection(
-    connection: &SerialConnection,
+    connection: &BrokerSerialConnection,
     max_bytes: usize,
     format: DataFormat,
     capture_config: ReadCaptureConfig,
@@ -481,10 +484,10 @@ fn read_payload_from_capture(
     })
 }
 
-async fn open_connection(config: ConnectionConfig) -> Result<SerialConnection> {
-    SerialConnection::new(config)
-        .await
-        .map_err(map_serial_error)
+async fn open_connection(config: ConnectionConfig) -> Result<Arc<BrokerSerialConnection>> {
+    let manager = BrokerConnectionManager::new();
+    let connection_id = manager.open(config).await.map_err(map_serial_error)?;
+    manager.get(&connection_id).await.map_err(map_serial_error)
 }
 
 fn connection_config(args: &SerialPortArgs, config: &Config) -> Result<ConnectionConfig> {

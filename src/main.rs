@@ -9,7 +9,7 @@ use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use serial_mcp_server::{
-    cli,
+    broker, cli,
     config::{Args, Command},
     tools::SerialHandler,
     Config, Result, SerialError,
@@ -32,6 +32,17 @@ async fn main() -> Result<()> {
     };
 
     let command = args.command.clone().unwrap_or(Command::Serve);
+
+    // The cross-process event stream uses this label to distinguish activity
+    // originating in MCP from one-shot CLI commands.
+    std::env::set_var(
+        serial_mcp_server::events::EVENT_SOURCE_ENV,
+        if matches!(command, Command::Serve) {
+            "mcp"
+        } else {
+            "cli"
+        },
+    );
 
     // Handle special flags first
     if args.generate_config || matches!(command, Command::GenerateConfig) {
@@ -72,6 +83,12 @@ async fn main() -> Result<()> {
         e
     })?;
 
+    broker::ensure_broker().await.map_err(|error| {
+        SerialError::ConnectionFailed(format!(
+            "Failed to initialize shared serial broker: {error}"
+        ))
+    })?;
+
     match command {
         Command::Serve => run_server(config).await,
         other => cli::run(other, &config).await,
@@ -96,9 +113,9 @@ async fn run_server(config: Config) -> Result<()> {
         config.serial.default_baud_rate, config.serial.max_buffer_size
     );
 
-    // Create handler and get reference to connection manager for cleanup
+    // The handler is an IPC client. Physical serial connections remain owned by
+    // the shared broker when this MCP stdio session ends.
     let handler = SerialHandler::new(config.clone());
-    let connection_manager = handler.connection_manager();
 
     // Create and serve the handler using rust-sdk standard pattern
     let service = handler.serve(stdio()).await.map_err(|e| {
@@ -119,13 +136,6 @@ async fn run_server(config: Config) -> Result<()> {
         _ = tokio::signal::ctrl_c() => {
             info!("Received shutdown signal");
         }
-    }
-
-    // Cleanup: close all open connections
-    info!("Cleaning up resources...");
-    let closed = connection_manager.close_all().await;
-    if closed > 0 {
-        info!("Closed {} open connection(s)", closed);
     }
 
     info!("Serial MCP Server stopped");

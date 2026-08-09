@@ -4,8 +4,9 @@
 [![RMCP](https://img.shields.io/badge/RMCP-0.3.2-blue.svg)](https://github.com/modelcontextprotocol/rust-sdk)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-`serial-mcp-server` provides serial port access for AI workflows in two forms:
+`serial-mcp-server` provides serial port access for AI workflows in three forms:
 
+- Tauri 2 desktop GUI with a serial console and live AI activity view.
 - MCP stdio server for clients that support MCP tools.
 - Scriptable CLI for direct use, CI, and agent skills without MCP setup.
 
@@ -46,6 +47,35 @@ AI agents can discover macro support from this README, from the bundled `skills/
 - Rust 1.74 or newer.
 - A serial device or USB-to-serial adapter when running hardware operations.
 - Device drivers and OS permissions for the selected serial port.
+
+## Tauri 2 Desktop GUI
+
+The GUI lives in `gui/`. GUI, MCP, and CLI do not create independent serial connections: they all connect to one local broker, and that broker is the only process that owns the physical port.
+
+```text
+GUI ─┐
+MCP ─┼─ TCP 127.0.0.1:47832 ─ single serial broker ─ physical port
+CLI ─┘                         └─ live events ─ GUI
+```
+
+Start the GUI first so it becomes the long-lived broker owner:
+
+```bash
+cd gui
+npm install
+npm run tauri dev
+```
+
+Shared behavior:
+
+- Opening the same port with the same settings from GUI and MCP returns the same `connection_id`.
+- MCP can discover connections created by GUI or CLI with `list_connections`.
+- Port-based CLI commands reuse an existing connection with matching settings.
+- A client exiting does not close the shared port; only an explicit `close` or broker-owner exit releases it.
+- One broker read loop owns physical RX. GUI receives live RX events without polling away bytes that MCP or CLI needs to consume.
+- TX, RX, connection, and control-line events carry the requesting source and PID.
+
+The broker defaults to `127.0.0.1:47832` and can be changed with `SERIAL_MCP_BROKER_ADDR`. UDP events default to `127.0.0.1:47831` and can be changed with `SERIAL_MCP_EVENT_ADDR`. See [`gui/README.md`](gui/README.md) for development and acceptance steps.
 
 ## Install From Source
 
@@ -200,6 +230,7 @@ Windows example:
 | Tool | Purpose |
 | --- | --- |
 | `list_ports` | Discover available serial ports. |
+| `list_connections` | List shared connections created by GUI, MCP, or CLI. |
 | `open` | Open a serial connection. |
 | `write` | Write UTF-8, hex, or base64 data to an open connection. |
 | `read` | Read data from an open connection with timeout handling or a bounded capture window. |

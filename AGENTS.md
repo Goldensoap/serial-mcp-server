@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 This repository provides a Rust MCP stdio server and one-shot CLI for serial port communication.
 
@@ -63,11 +63,14 @@ stdout is data only. Diagnostics and logs go to stderr or a configured log file.
 `serial-mcp-server` is a Rust MCP stdio server and one-shot CLI for serial port communication.
 
 - `src/main.rs`: argument parsing, logging setup, command dispatch, MCP server startup.
+- `src/broker.rs`: single-owner localhost broker shared by GUI, MCP, and CLI.
+- `src/events.rs`: cross-process JSONL and UDP event stream consumed by the GUI.
 - `src/config.rs`: clap arguments, subcommands, TOML config, validation.
 - `src/cli.rs`: one-shot CLI command execution.
 - `src/tools/serial_handler.rs`: MCP tool handler and six MCP tools.
 - `src/serial/**`: serial connection wrapper, connection manager, port listing.
 - `src/session/**`: session abstractions used by supporting APIs and tests.
+- `gui/**`: Tauri 2 desktop app and vanilla TypeScript frontend.
 - `skills/serial-debug/**`: Codex and Claude Code compatible skill, CLI-first with MCP optional.
 
 ## MCP Tool Model

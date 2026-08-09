@@ -102,7 +102,7 @@ impl ConnectionManager {
         let mut connections = self.connections.write().await;
 
         // Check if port is already in use
-        for (_, conn) in connections.iter() {
+        for conn in connections.values() {
             if conn.status().await.port == config.port {
                 return Err(LocalSerialError::ConnectionExists(config.port));
             }

@@ -18,13 +18,15 @@ use crate::automation::{
     plan_target, MacroExecutor, MacroPack, MacroPlan, MacroRegistry, RunReport,
     SerialMacroTransport, SimulatedMacroTransport,
 };
+use crate::broker::BrokerConnectionManager;
 use crate::config::Config;
-use crate::serial::{CaptureConfig, ConnectionManager, PortInfo};
+use crate::events::{publish, SerialEvent};
+use crate::serial::CaptureConfig;
 
 /// Serial tool handler using rust-sdk standard patterns
 #[derive(Clone)]
 pub struct SerialHandler {
-    connection_manager: Arc<ConnectionManager>,
+    connection_manager: Arc<BrokerConnectionManager>,
     macro_registry: Arc<MacroRegistry>,
     #[allow(dead_code)]
     config: Config,
@@ -35,22 +37,18 @@ pub struct SerialHandler {
 impl SerialHandler {
     pub fn new(config: Config) -> Self {
         Self {
-            connection_manager: Arc::new(ConnectionManager::new()),
+            connection_manager: Arc::new(BrokerConnectionManager::new()),
             macro_registry: Arc::new(MacroRegistry::default()),
             config,
             tool_router: Self::tool_router(),
         }
     }
 
-    /// Get a reference to the connection manager for shutdown handling
-    pub fn connection_manager(&self) -> Arc<ConnectionManager> {
-        Arc::clone(&self.connection_manager)
-    }
-
     pub async fn macro_load_pack(
         &self,
         args: MacroLoadArgs,
     ) -> Result<crate::automation::MacroLoadRecord, McpError> {
+        publish_tool_invocation("macro_load", None, None);
         let input = macro_pack_input(args)?;
         self.macro_registry.load_json(&input).map_err(mcp_error)
     }
@@ -59,12 +57,14 @@ impl SerialHandler {
         &self,
         pack_id: Option<String>,
     ) -> Result<crate::automation::MacroList, McpError> {
+        publish_tool_invocation("macro_list", None, None);
         self.macro_registry
             .list(pack_id.as_deref())
             .map_err(mcp_error)
     }
 
     pub async fn macro_unload_pack(&self, pack_id: &str) -> Result<MacroUnloadResponse, McpError> {
+        publish_tool_invocation("macro_unload", None, None);
         let unloaded = self.macro_registry.unload(pack_id).map_err(mcp_error)?;
         Ok(MacroUnloadResponse {
             pack_id: pack_id.to_string(),
@@ -73,6 +73,7 @@ impl SerialHandler {
     }
 
     pub async fn macro_plan_pack(&self, args: MacroPlanArgs) -> Result<MacroPlan, McpError> {
+        publish_tool_invocation("macro_plan", None, None);
         let target = args.target.into_target().map_err(mcp_error)?;
         match (args.pack_id, args.pack_json, args.path) {
             (Some(pack_id), None, None) => self
@@ -95,6 +96,7 @@ impl SerialHandler {
     }
 
     pub async fn macro_run_loaded(&self, args: MacroRunArgs) -> Result<RunReport, McpError> {
+        publish_tool_invocation("macro_run", None, None);
         let target = args.target.into_target().map_err(mcp_error)?;
         let plan = self
             .macro_registry
@@ -107,6 +109,7 @@ impl SerialHandler {
         &self,
         args: MacroRunInlineArgs,
     ) -> Result<RunReport, McpError> {
+        publish_tool_invocation("macro_run_inline", None, None);
         let pack: MacroPack = serde_json::from_str(&args.pack_json).map_err(mcp_error)?;
         let target = args.target.into_target().map_err(mcp_error)?;
         let plan = plan_target(&pack, target).map_err(mcp_error)?;
@@ -196,8 +199,9 @@ impl SerialHandler {
     #[tool(description = "List all available serial ports on the system")]
     async fn list_ports(&self) -> Result<CallToolResult, McpError> {
         debug!("Listing available serial ports");
+        publish_tool_invocation("list_ports", None, None);
 
-        match PortInfo::list_ports() {
+        match self.connection_manager.list_ports().await {
             Ok(ports) => {
                 info!("Found {} serial ports", ports.len());
 
@@ -231,12 +235,20 @@ impl SerialHandler {
         }
     }
 
+    #[tool(description = "List shared serial connections opened by GUI, MCP, or CLI")]
+    async fn list_connections(&self) -> Result<CallToolResult, McpError> {
+        publish_tool_invocation("list_connections", None, None);
+        let connections = self.connection_manager.list().await.map_err(mcp_error)?;
+        tool_json(&connections)
+    }
+
     #[tool(description = "Open a serial port connection with specified configuration")]
     async fn open(
         &self,
         Parameters(args): Parameters<OpenArgs>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Opening serial connection to {}", args.port);
+        publish_tool_invocation("open", None, Some(&args.port));
 
         let config: crate::serial::ConnectionConfig = args.into();
 
@@ -268,6 +280,7 @@ impl SerialHandler {
         Parameters(args): Parameters<CloseArgs>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Closing serial connection {}", args.connection_id);
+        publish_tool_invocation("close", Some(&args.connection_id), None);
 
         match self.connection_manager.close(&args.connection_id).await {
             Ok(()) => {
@@ -298,6 +311,7 @@ impl SerialHandler {
             "Writing to connection {} with encoding {}",
             args.connection_id, args.encoding
         );
+        publish_tool_invocation("write", Some(&args.connection_id), None);
 
         // Get connection
         let connection = match self.connection_manager.get(&args.connection_id).await {
@@ -355,6 +369,7 @@ impl SerialHandler {
             "Setting control lines on connection {}: rts={:?} dtr={:?}",
             args.connection_id, args.rts, args.dtr
         );
+        publish_tool_invocation("set_control_lines", Some(&args.connection_id), None);
 
         if !args.has_line_update() {
             return Err(McpError::internal_error(
@@ -425,6 +440,7 @@ impl SerialHandler {
             "Reading from connection {} with timeout {:?}",
             args.connection_id, args.timeout_ms
         );
+        publish_tool_invocation("read", Some(&args.connection_id), None);
 
         // Get connection
         let connection = match self.connection_manager.get(&args.connection_id).await {
@@ -556,7 +572,7 @@ impl ServerHandler for SerialHandler {
             protocol_version: ProtocolVersion::V_2024_11_05,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
-            instructions: Some("A serial port communication MCP server. Use list_ports to discover available serial ports, then open connections to communicate with serial devices.".to_string()),
+            instructions: Some("A shared serial-port MCP server. Use list_connections first to discover ports already opened by the GUI or CLI. Use list_ports and open when a shared connection does not exist; opening the same port with identical settings returns the existing connection ID.".to_string()),
         }
     }
 
@@ -584,6 +600,18 @@ fn tool_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     serde_json::to_string_pretty(value)
         .map(|json| CallToolResult::success(vec![Content::text(json)]))
         .map_err(mcp_error)
+}
+
+fn publish_tool_invocation(tool: &str, connection_id: Option<&str>, port: Option<&str>) {
+    let mut event = SerialEvent::new("tool.invoked", format!("MCP tool invoked: {tool}"))
+        .details(serde_json::json!({ "tool": tool }));
+    if let Some(connection_id) = connection_id {
+        event = event.connection(connection_id);
+    }
+    if let Some(port) = port {
+        event = event.port(port);
+    }
+    publish(event);
 }
 
 fn mcp_error(error: impl std::fmt::Display) -> McpError {
