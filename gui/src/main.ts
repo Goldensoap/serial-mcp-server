@@ -120,7 +120,29 @@ app.innerHTML = `
           <i data-lucide="chevron-down"></i>
         </div>
         <div class="field-grid">
-          <label><span>波特率</span><input id="baud-rate" type="number" min="1" max="4000000" value="115200" /></label>
+          <label>
+            <span>波特率</span>
+            <div class="field-select-wrap">
+              <select id="baud-rate">
+                <option value="300">300</option>
+                <option value="600">600</option>
+                <option value="1200">1200</option>
+                <option value="2400">2400</option>
+                <option value="4800">4800</option>
+                <option value="9600">9600</option>
+                <option value="14400">14400</option>
+                <option value="19200">19200</option>
+                <option value="28800">28800</option>
+                <option value="38400">38400</option>
+                <option value="57600">57600</option>
+                <option value="115200" selected>115200</option>
+                <option value="230400">230400</option>
+                <option value="460800">460800</option>
+                <option value="921600">921600</option>
+              </select>
+              <i data-lucide="chevron-down"></i>
+            </div>
+          </label>
           <label><span>数据位</span><select id="data-bits"><option>8</option><option>7</option><option>6</option><option>5</option></select></label>
           <label><span>停止位</span><select id="stop-bits"><option>1</option><option>2</option></select></label>
           <label><span>校验</span><select id="parity"><option value="none">None</option><option value="even">Even</option><option value="odd">Odd</option></select></label>
@@ -459,7 +481,7 @@ async function openPort(): Promise<void> {
     const response = await invoke<{ connectionId: string }>("open_port", {
       request: {
         port,
-        baudRate: Number(byId<HTMLInputElement>("baud-rate").value),
+        baudRate: Number(byId<HTMLSelectElement>("baud-rate").value),
         dataBits: byId<HTMLSelectElement>("data-bits").value,
         stopBits: byId<HTMLSelectElement>("stop-bits").value,
         parity: byId<HTMLSelectElement>("parity").value,
