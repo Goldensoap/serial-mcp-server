@@ -1,0 +1,26 @@
+<?if $(sys.BUILDARCH)="x86"?>
+    <?define Win64 = "no" ?>
+<?else?>
+    <?define Win64 = "yes" ?>
+<?endif?>
+
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Fragment>
+        <DirectoryRef Id="INSTALLDIR">
+            <Component
+                Id="AddInstallDirToPath"
+                Guid="E552D84E-DF79-45C8-B8AF-D4E25DB04452"
+                Win64="$(var.Win64)"
+                KeyPath="yes">
+                <Environment
+                    Id="InstallDirPathEnvironment"
+                    Name="PATH"
+                    Value="[INSTALLDIR]"
+                    Action="set"
+                    Part="last"
+                    Permanent="no"
+                    System="yes" />
+            </Component>
+        </DirectoryRef>
+    </Fragment>
+</Wix>

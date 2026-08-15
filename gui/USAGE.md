@@ -13,37 +13,38 @@ GUI 启动时不会自动启动 MCP stdio 服务。MCP 服务应由 Codex、Clau
 
 ## CLI
 
-在 PowerShell 中进入本安装目录，或者使用 `serial-mcp-server.exe` 的完整路径：
+MSI 安装会把安装目录加入系统 `PATH`。重新打开 PowerShell 后，可以直接运行：
 
 ```powershell
-.\serial-mcp-server.exe list-ports --json
-.\serial-mcp-server.exe probe --port COM3 --baud 115200 --json
-.\serial-mcp-server.exe write --port COM3 --baud 115200 --data HELLO --read --json
-.\serial-mcp-server.exe read --port COM3 --baud 115200 --timeout-ms 1000 --json
+serial-mcp-server.exe list-ports --json
+serial-mcp-server.exe probe --port COM3 --baud 115200 --json
+serial-mcp-server.exe write --port COM3 --baud 115200 --data HELLO --read --json
+serial-mcp-server.exe read --port COM3 --baud 115200 --timeout-ms 1000 --json
 ```
 
 查看全部参数：
 
 ```powershell
-.\serial-mcp-server.exe --help
+serial-mcp-server.exe --help
 ```
 
 ## MCP 客户端配置
 
-将 MCP 客户端的 `command` 设置为安装目录中 `serial-mcp-server.exe` 的绝对路径，并添加 `serve` 参数。例如：
+重启 MCP 客户端以读取更新后的系统 `PATH`，然后将 `command` 设置为
+`serial-mcp-server.exe`，并添加 `serve` 参数。例如：
 
 ```json
 {
   "mcpServers": {
     "serial": {
-      "command": "C:\\Program Files\\Serial MCP Console\\serial-mcp-server.exe",
+      "command": "serial-mcp-server.exe",
       "args": ["serve"]
     }
   }
 }
 ```
 
-如果安装时选择了其他目录，请相应修改路径。MCP 使用 stdio 通信，不应直接双击运行服务端。
+也可以继续使用安装目录中的绝对路径。MCP 使用 stdio 通信，不应直接双击运行服务端。
 
 ## 共享代理与退出行为
 

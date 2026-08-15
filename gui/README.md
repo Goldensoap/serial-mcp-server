@@ -52,6 +52,9 @@ npm run tauri -- build --bundles msi
 - `serial-mcp-server.exe`：CLI 与 MCP stdio 服务端。
 - `USAGE.md`：安装后使用说明。
 
+MSI 会把安装目录加入系统 `PATH`。重新打开终端或重启 MCP 客户端后，可以直接以
+`serial-mcp-server` 调用 CLI 和 MCP 服务端；卸载时会移除该 `PATH` 条目。
+
 MSI 默认输出到 `src-tauri/target/release/bundle/msi/`。生成的 `src-tauri/binaries/` 是临时构建输出，不应提交。
 
 ## 验收流程
