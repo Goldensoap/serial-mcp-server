@@ -118,6 +118,7 @@ select { appearance: none; cursor: pointer; }
 .connection-copy strong { overflow: hidden; text-overflow: ellipsis; font: 600 11px var(--mono); color: #dce3e1; }
 .connection-copy small { overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: 9px; white-space: nowrap; }
 .connection-live { width: 6px; height: 6px; background: var(--accent); border-radius: 50%; box-shadow: 0 0 7px rgba(217, 255, 67, 0.65); }
+.connection-id { grid-column: 1 / -1; min-width: 0; padding: 0 8px 6px; color: #879497; font: 8.5px/1.4 var(--mono); overflow-wrap: anywhere; user-select: text; cursor: text; }
 .empty-mini { display: flex; align-items: center; gap: 9px; color: #667277; font-size: 11px; padding: 9px; }
 .empty-mini svg { width: 14px; }
 

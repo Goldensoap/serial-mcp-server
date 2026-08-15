@@ -181,7 +181,7 @@ pub struct WriteCommand {
     #[arg(long)]
     pub timeout_ms: Option<u64>,
 
-    /// Maximum bytes to read when --read is used
+    /// Maximum bytes to read when --read is used (1..=65536)
     #[arg(long, default_value_t = 1024)]
     pub max_bytes: usize,
 
@@ -202,7 +202,7 @@ pub struct ReadCommand {
     #[arg(long)]
     pub timeout_ms: Option<u64>,
 
-    /// Maximum bytes to read
+    /// Maximum bytes to read (1..=65536)
     #[arg(long, default_value_t = 1024)]
     pub max_bytes: usize,
 

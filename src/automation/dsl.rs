@@ -80,6 +80,7 @@ pub struct ExpectStep {
     #[serde(default = "default_idle_ms")]
     pub idle_ms: u64,
     #[serde(default = "default_max_bytes")]
+    #[schemars(range(min = 1, max = 65536))]
     pub max_bytes: usize,
     #[serde(default)]
     pub trim: bool,

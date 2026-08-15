@@ -2,7 +2,10 @@ use std::collections::HashSet;
 
 use serde::Serialize;
 
-use super::{AssemblyStep, AutomationError, AutomationResult, MacroPack, MacroStep, SendStep};
+use super::{
+    limits::max_bytes_error, AssemblyStep, AutomationError, AutomationResult, MacroPack, MacroStep,
+    SendStep,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MacroInventory {
@@ -110,10 +113,10 @@ fn validate_macro_steps(macro_index: usize, steps: &[MacroStep]) -> AutomationRe
                         "idle boundary must be greater than zero",
                     ));
                 }
-                if step.max_bytes == 0 {
+                if let Some(message) = max_bytes_error(step.max_bytes) {
                     return Err(AutomationError::validation(
                         format!("macros[{macro_index}].steps[{step_index}].max_bytes"),
-                        "max bytes must be greater than zero",
+                        message,
                     ));
                 }
             }

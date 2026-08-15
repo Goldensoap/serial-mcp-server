@@ -44,6 +44,9 @@ MCP `read` keeps single-read behavior when `duration_ms` is absent. Add
 }
 ```
 
+`max_bytes` must be between 1 and 65,536 for direct reads, capture windows,
+and macro `expect` steps.
+
 `start_trigger` can be `first_byte` or `immediate`. Capture responses include
 `completion_reason`, `waited_ms`, `elapsed_ms`, and `chunks`.
 

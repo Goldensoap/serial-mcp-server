@@ -56,6 +56,7 @@ serial-mcp-server read --port <port> --baud 115200 \
 
 Capture mode returns combined data plus `completion_reason`, `waited_ms`,
 `elapsed_ms`, and `chunks`. `write --read` accepts the same capture options.
+`--max-bytes` must be between 1 and 65,536.
 
 ## Macro Packs
 

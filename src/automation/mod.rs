@@ -3,6 +3,7 @@
 mod dsl;
 mod error;
 mod executor;
+mod limits;
 mod planner;
 mod registry;
 mod transport;

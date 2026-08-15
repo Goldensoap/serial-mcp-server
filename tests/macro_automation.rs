@@ -1,8 +1,11 @@
 use clap::Parser;
 use serial_mcp_server::automation::{
-    plan_target, validate_pack, MacroExecutor, MacroPack, MacroTarget, SimulatedMacroTransport,
+    plan_target, validate_pack, AutomationError, MacroExecutor, MacroPack, MacroTarget,
+    SimulatedMacroTransport,
 };
+use serial_mcp_server::broker::MAX_READ_BYTES;
 use serial_mcp_server::config::{Args, Command, MacroCommand};
+use serial_mcp_server::events::{EVENT_ADDRESS_ENV, EVENT_LOG_ENV};
 use serial_mcp_server::tools::{
     MacroLoadArgs, MacroPlanArgs, MacroRunArgs, MacroRunInput, MacroTargetArgs,
 };
@@ -105,6 +108,53 @@ fn macro_dsl_rejects_invalid_packs_before_execution() {
 }
 
 #[test]
+fn macro_dsl_enforces_expect_max_bytes_without_hardware() {
+    let pack_with_max_bytes = |max_bytes| {
+        parse_pack(&format!(
+            r#"{{
+                "schema_version": "0.3",
+                "name": "read-bounds",
+                "macros": [
+                    {{
+                        "name": "bounded-read",
+                        "steps": [
+                            {{
+                                "type": "expect",
+                                "op": "contains",
+                                "data": "OK",
+                                "max_bytes": {max_bytes}
+                            }}
+                        ]
+                    }}
+                ]
+            }}"#
+        ))
+    };
+
+    validate_pack(&pack_with_max_bytes(1)).expect("one byte should be accepted");
+    validate_pack(&pack_with_max_bytes(MAX_READ_BYTES))
+        .expect("the shared read limit should be accepted");
+
+    for (max_bytes, expected_message) in [
+        (0, "max_bytes must be greater than zero".to_string()),
+        (
+            MAX_READ_BYTES + 1,
+            format!("max_bytes must not exceed {MAX_READ_BYTES}"),
+        ),
+    ] {
+        let error = validate_pack(&pack_with_max_bytes(max_bytes))
+            .expect_err("out-of-range max_bytes should be rejected");
+        match error {
+            AutomationError::Validation { field, message } => {
+                assert_eq!(field, "macros[0].steps[0].max_bytes");
+                assert_eq!(message, expected_message);
+            }
+            other => panic!("expected validation error, got {other}"),
+        }
+    }
+}
+
+#[test]
 fn macro_planner_expands_targets_without_hardware() {
     let pack = parse_pack(pack_json());
     validate_pack(&pack).expect("pack should validate");
@@ -187,6 +237,10 @@ async fn macro_executor_runs_send_delay_expect_contains_equals() {
 
 #[tokio::test]
 async fn macro_mcp_registry_is_runtime_only() {
+    let event_dir = tempfile::tempdir().expect("event temp dir should create");
+    std::env::set_var(EVENT_LOG_ENV, event_dir.path().join("events.jsonl"));
+    std::env::set_var(EVENT_ADDRESS_ENV, "127.0.0.1:9");
+
     let handler = SerialHandler::new(Config::default());
     let loaded = handler
         .macro_load_pack(MacroLoadArgs {
@@ -317,7 +371,11 @@ fn macro_hardware_boundary_is_explicit() {
 
 #[test]
 fn macro_cli_json_errors_are_structured() {
+    let event_dir = tempfile::tempdir().expect("event temp dir should create");
+    let event_log = event_dir.path().join("events.jsonl");
     let output = CliCommand::new(env!("CARGO_BIN_EXE_serial-mcp-server"))
+        .env(EVENT_LOG_ENV, &event_log)
+        .env(EVENT_ADDRESS_ENV, "127.0.0.1:9")
         .args([
             "macro",
             "plan",
@@ -351,6 +409,8 @@ fn macro_cli_json_errors_are_structured() {
     .expect("temp file should write");
 
     let output = CliCommand::new(env!("CARGO_BIN_EXE_serial-mcp-server"))
+        .env(EVENT_LOG_ENV, &event_log)
+        .env(EVENT_ADDRESS_ENV, "127.0.0.1:9")
         .args([
             "macro",
             "validate",
@@ -370,6 +430,8 @@ fn macro_cli_json_errors_are_structured() {
     assert_eq!(json["field"], "macros[1].name");
 
     let output = CliCommand::new(env!("CARGO_BIN_EXE_serial-mcp-server"))
+        .env(EVENT_LOG_ENV, &event_log)
+        .env(EVENT_ADDRESS_ENV, "127.0.0.1:9")
         .args([
             "macro",
             "plan",

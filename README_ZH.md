@@ -73,7 +73,8 @@ npm run tauri dev
 - CLI 的按端口命令会复用相同配置的已打开连接。
 - 客户端进程退出不会关闭共享连接；只有显式 `close` 或代理宿主退出才会释放串口。
 - 代理只读取物理 RX 一次，并通过有界缓冲提供给 MCP/CLI；GUI 从事件流实时显示 RX，不会轮询并抢走 AI 要读取的数据。
-- TX、RX、连接与控制线事件带来源和 PID，GUI 可区分 GUI、MCP、CLI 和设备活动。
+- MCP 与 CLI reader 共享一个有界、消费式 RX FIFO；一方读走的字节不会再向另一方重放，GUI 仍可独立通过事件流旁观。
+- 请求方触发的命令/工具调用、TX、连接与控制线事件带请求方来源和 PID；物理 RX 事件标记为 `device`，PID 为代理宿主进程。
 
 本机代理默认地址为 `127.0.0.1:47832`，可用 `SERIAL_MCP_BROKER_ADDR` 修改。事件 UDP 地址默认为 `127.0.0.1:47831`，可用 `SERIAL_MCP_EVENT_ADDR` 修改。详细开发与验收步骤见 [`gui/README.md`](gui/README.md)。
 
@@ -134,7 +135,7 @@ serial-mcp-server read --port <port> --baud 115200 \
 - `--start-trigger immediate`：命令开始时就开始计算采集时长。
 - `--initial-timeout-ms`：first-byte 模式下最多等多久开始采集。不传时使用 `--timeout-ms`。
 - `--idle-timeout-ms`：采集开始后，连续空闲多久就提前停止。
-- `--max-bytes`：合并返回数据的硬上限。
+- `--max-bytes`：合并返回数据的硬上限，有效范围为 1 到 65,536。
 
 `write --read` 也支持同一组采集参数：
 
@@ -252,6 +253,8 @@ MCP `read` 除了 `connection_id`、`timeout_ms`、`max_bytes` 和 `encoding`，
   "encoding": "utf8"
 }
 ```
+
+直接读取、采集窗口以及 macro `expect` 步骤的 `max_bytes` 有效范围均为 1 到 65,536。
 
 不传 `duration_ms` 时，MCP `read` 保持原有单次读取行为。传入 `duration_ms` 后，工具返回结构化 JSON 文本，包含 `completion_reason`、`waited_ms`、`elapsed_ms` 和 `chunks`。
 

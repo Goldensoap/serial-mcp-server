@@ -2,13 +2,14 @@ use crate::automation::{
     plan_target, validate_pack, MacroExecutor, MacroPack, MacroTarget, SerialMacroTransport,
     SimulatedMacroTransport,
 };
-use crate::broker::{BrokerConnectionManager, BrokerSerialConnection};
+use crate::broker::{BrokerConnectionManager, BrokerSerialConnection, MAX_READ_BYTES};
 use crate::config::{
     CliDataFormat, Command, ControlLineLevel, MacroCommand, MacroFileCommand, MacroPlanCommand,
     MacroRunCommand, OptionalSerialPortArgs, ReadCommand, SerialPortArgs, SetControlLinesCommand,
     WriteCommand,
 };
 use crate::error::{Result, SerialError};
+use crate::events::{publish, SerialEvent};
 use crate::serial::{
     CaptureChunk, CaptureCompletionReason, CaptureConfig, CaptureReport, CaptureStartTrigger,
     ConnectionConfig, DataBits, FlowControl, LocalSerialError, Parity, PortInfo, StopBits,
@@ -19,6 +20,8 @@ use serde::Serialize;
 use std::sync::Arc;
 
 pub async fn run(command: Command, config: &Config) -> Result<()> {
+    publish_command_invocation(&command);
+
     match command {
         Command::ListPorts(args) => list_ports(args.json).await,
         Command::Probe(args) => probe(args, config).await,
@@ -33,6 +36,31 @@ pub async fn run(command: Command, config: &Config) -> Result<()> {
             "server/config command reached CLI command dispatcher".to_string(),
         )),
     }
+}
+
+fn publish_command_invocation(command: &Command) {
+    let (name, port) = match command {
+        Command::ListPorts(_) => ("list-ports", None),
+        Command::Probe(args) => ("probe", Some(args.port.as_str())),
+        Command::Write(args) => ("write", Some(args.serial.port.as_str())),
+        Command::Read(args) => ("read", Some(args.serial.port.as_str())),
+        Command::SetControlLines(args) => ("set-control-lines", Some(args.serial.port.as_str())),
+        Command::Macro(MacroCommand::Validate(_)) => ("macro validate", None),
+        Command::Macro(MacroCommand::List(_)) => ("macro list", None),
+        Command::Macro(MacroCommand::Plan(_)) => ("macro plan", None),
+        Command::Macro(MacroCommand::Run(args)) => ("macro run", args.serial.port.as_deref()),
+        Command::Serve => ("serve", None),
+        Command::GenerateConfig => ("generate-config", None),
+        Command::ValidateConfig => ("validate-config", None),
+        Command::ShowConfig => ("show-config", None),
+    };
+
+    let mut event = SerialEvent::new("command.invoked", format!("CLI command invoked: {name}"))
+        .details(serde_json::json!({ "command": name }));
+    if let Some(port) = port {
+        event = event.port(port);
+    }
+    publish(event);
 }
 
 async fn macro_command(args: MacroCommand, config: &Config) -> Result<()> {
@@ -242,27 +270,24 @@ async fn write(args: WriteCommand, config: &Config) -> Result<()> {
     let json = args.serial.json;
     let connection_config = connection_config(&args.serial, config)?;
     let baud_rate = connection_config.baud_rate;
-    let connection = open_connection(connection_config).await?;
+    let read_config = if args.read {
+        Some(capture_config(
+            args.timeout_ms.unwrap_or(config.serial.default_timeout_ms),
+            args.max_bytes,
+            args.capture.duration_ms,
+            args.capture.start_trigger,
+            args.capture.initial_timeout_ms,
+            args.capture.idle_timeout_ms,
+        )?)
+    } else {
+        None
+    };
     let format = args.format.as_data_format();
     let payload = DataConverter::decode(&args.data, format)?;
+    let connection = open_connection(connection_config).await?;
     let bytes_written = connection.write(&payload).await.map_err(map_serial_error)?;
-    let read = if args.read {
-        Some(
-            read_from_connection(
-                &connection,
-                args.max_bytes,
-                format,
-                capture_config(
-                    args.timeout_ms.unwrap_or(config.serial.default_timeout_ms),
-                    args.max_bytes,
-                    args.capture.duration_ms,
-                    args.capture.start_trigger,
-                    args.capture.initial_timeout_ms,
-                    args.capture.idle_timeout_ms,
-                )?,
-            )
-            .await?,
-        )
+    let read = if let Some(read_config) = read_config {
+        Some(read_from_connection(&connection, args.max_bytes, format, read_config).await?)
     } else {
         None
     };
@@ -290,19 +315,20 @@ async fn read(args: ReadCommand, config: &Config) -> Result<()> {
     let json = args.serial.json;
     let connection_config = connection_config(&args.serial, config)?;
     let baud_rate = connection_config.baud_rate;
+    let read_config = capture_config(
+        args.timeout_ms.unwrap_or(config.serial.default_timeout_ms),
+        args.max_bytes,
+        args.capture.duration_ms,
+        args.capture.start_trigger,
+        args.capture.initial_timeout_ms,
+        args.capture.idle_timeout_ms,
+    )?;
     let connection = open_connection(connection_config).await?;
     let read = read_from_connection(
         &connection,
         args.max_bytes,
         args.format.as_data_format(),
-        capture_config(
-            args.timeout_ms.unwrap_or(config.serial.default_timeout_ms),
-            args.max_bytes,
-            args.capture.duration_ms,
-            args.capture.start_trigger,
-            args.capture.initial_timeout_ms,
-            args.capture.idle_timeout_ms,
-        )?,
+        read_config,
     )
     .await?;
     let output = ReadOutput {
@@ -433,6 +459,17 @@ fn capture_config(
     initial_timeout_ms: Option<u64>,
     idle_timeout_ms: Option<u64>,
 ) -> Result<ReadCaptureConfig> {
+    if max_bytes == 0 {
+        return Err(SerialError::InvalidConfig(
+            "max_bytes must be greater than zero".to_string(),
+        ));
+    }
+    if max_bytes > MAX_READ_BYTES {
+        return Err(SerialError::InvalidConfig(format!(
+            "max_bytes must not exceed {MAX_READ_BYTES}"
+        )));
+    }
+
     let Some(duration_ms) = duration_ms else {
         return Ok(ReadCaptureConfig {
             timeout_ms,
@@ -740,4 +777,142 @@ fn macro_error_field(message: &str) -> Option<String> {
 fn backtick_value_after(message: &str, prefix: &str) -> Option<String> {
     let rest = message.split_once(prefix)?.1;
     Some(rest.split_once('`')?.0.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn serial_args() -> SerialPortArgs {
+        SerialPortArgs {
+            port: "missing-test-port".to_string(),
+            baud: None,
+            data_bits: None,
+            stop_bits: None,
+            parity: None,
+            flow_control: None,
+            json: false,
+        }
+    }
+
+    fn capture_args() -> crate::config::CaptureWindowArgs {
+        crate::config::CaptureWindowArgs {
+            duration_ms: None,
+            start_trigger: CaptureStartTrigger::FirstByte,
+            initial_timeout_ms: None,
+            idle_timeout_ms: None,
+        }
+    }
+
+    #[test]
+    fn zero_max_bytes_is_rejected_for_single_reads() {
+        let error = capture_config(1_000, 0, None, CaptureStartTrigger::FirstByte, None, None)
+            .expect_err("zero-length reads must be rejected before reaching the broker");
+
+        assert!(matches!(
+            error,
+            SerialError::InvalidConfig(reason) if reason == "max_bytes must be greater than zero"
+        ));
+    }
+
+    #[test]
+    fn maximum_max_bytes_is_accepted_for_single_reads() {
+        capture_config(
+            1_000,
+            MAX_READ_BYTES,
+            None,
+            CaptureStartTrigger::FirstByte,
+            None,
+            None,
+        )
+        .expect("the documented limit must be accepted");
+    }
+
+    #[tokio::test]
+    async fn oversized_max_bytes_is_rejected_before_read_opens_port() {
+        let args = ReadCommand {
+            serial: serial_args(),
+            format: CliDataFormat::Utf8,
+            timeout_ms: None,
+            max_bytes: MAX_READ_BYTES + 1,
+            capture: capture_args(),
+        };
+
+        let error = read(args, &Config::default())
+            .await
+            .expect_err("oversized reads must be rejected before opening the port");
+
+        assert!(matches!(
+            error,
+            SerialError::InvalidConfig(reason)
+                if reason == format!("max_bytes must not exceed {MAX_READ_BYTES}")
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_max_bytes_is_rejected_before_write_opens_port() {
+        let args = WriteCommand {
+            serial: serial_args(),
+            data: "H".to_string(),
+            format: CliDataFormat::Utf8,
+            read: true,
+            timeout_ms: None,
+            max_bytes: MAX_READ_BYTES + 1,
+            capture: capture_args(),
+        };
+
+        let error = write(args, &Config::default())
+            .await
+            .expect_err("oversized response reads must be rejected before opening the port");
+
+        assert!(matches!(
+            error,
+            SerialError::InvalidConfig(reason)
+                if reason == format!("max_bytes must not exceed {MAX_READ_BYTES}")
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_hex_write_is_rejected_before_opening_the_port() {
+        let args = WriteCommand {
+            serial: serial_args(),
+            data: "not-hex".to_string(),
+            format: CliDataFormat::Hex,
+            read: false,
+            timeout_ms: None,
+            max_bytes: 1_024,
+            capture: capture_args(),
+        };
+
+        let error = write(args, &Config::default())
+            .await
+            .expect_err("invalid hex must be rejected before opening the missing port");
+
+        assert!(matches!(
+            error,
+            SerialError::EncodingError(reason) if reason.starts_with("Hex decoding failed:")
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_base64_write_is_rejected_before_opening_the_port() {
+        let args = WriteCommand {
+            serial: serial_args(),
+            data: "%%%".to_string(),
+            format: CliDataFormat::Base64,
+            read: false,
+            timeout_ms: None,
+            max_bytes: 1_024,
+            capture: capture_args(),
+        };
+
+        let error = write(args, &Config::default())
+            .await
+            .expect_err("invalid base64 must be rejected before opening the missing port");
+
+        assert!(matches!(
+            error,
+            SerialError::EncodingError(reason) if reason.starts_with("Base64 decoding failed:")
+        ));
+    }
 }

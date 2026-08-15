@@ -18,7 +18,7 @@ use crate::automation::{
     plan_target, MacroExecutor, MacroPack, MacroPlan, MacroRegistry, RunReport,
     SerialMacroTransport, SimulatedMacroTransport,
 };
-use crate::broker::BrokerConnectionManager;
+use crate::broker::{BrokerConnectionManager, MAX_READ_BYTES};
 use crate::config::Config;
 use crate::events::{publish, SerialEvent};
 use crate::serial::CaptureConfig;
@@ -250,7 +250,7 @@ impl SerialHandler {
         debug!("Opening serial connection to {}", args.port);
         publish_tool_invocation("open", None, Some(&args.port));
 
-        let config: crate::serial::ConnectionConfig = args.into();
+        let config = crate::serial::ConnectionConfig::try_from(args).map_err(mcp_invalid_params)?;
 
         match self.connection_manager.open(config.clone()).await {
             Ok(connection_id) => {
@@ -313,25 +313,14 @@ impl SerialHandler {
         );
         publish_tool_invocation("write", Some(&args.connection_id), None);
 
+        let data = decode_data(&args.data, &args.encoding).map_err(mcp_invalid_params)?;
+
         // Get connection
         let connection = match self.connection_manager.get(&args.connection_id).await {
             Ok(conn) => conn,
             Err(e) => {
                 error!("Invalid connection ID {}: {}", args.connection_id, e);
                 let error_msg = format!("Error: Connection ID {} not found", args.connection_id);
-                return Err(McpError::internal_error(error_msg, None));
-            }
-        };
-
-        // Decode data
-        let data = match decode_data(&args.data, &args.encoding) {
-            Ok(data) => data,
-            Err(e) => {
-                error!(
-                    "Failed to decode data with encoding {}: {}",
-                    args.encoding, e
-                );
-                let error_msg = format!("Error: Data decoding failed - {}", e);
                 return Err(McpError::internal_error(error_msg, None));
             }
         };
@@ -372,9 +361,8 @@ impl SerialHandler {
         publish_tool_invocation("set_control_lines", Some(&args.connection_id), None);
 
         if !args.has_line_update() {
-            return Err(McpError::internal_error(
-                "At least one of 'rts' or 'dtr' must be specified".to_string(),
-                None,
+            return Err(mcp_invalid_params(
+                "At least one of 'rts' or 'dtr' must be specified",
             ));
         }
 
@@ -442,6 +430,23 @@ impl SerialHandler {
         );
         publish_tool_invocation("read", Some(&args.connection_id), None);
 
+        validate_encoding(&args.encoding)?;
+        validate_max_bytes(args.max_bytes)?;
+        let timeout_ms = args
+            .timeout_ms
+            .unwrap_or(self.config.serial.default_timeout_ms);
+        let capture_config = args.duration_ms.map(|duration_ms| CaptureConfig {
+            timeout_ms,
+            max_bytes: args.max_bytes,
+            duration_ms,
+            start_trigger: args.start_trigger,
+            initial_timeout_ms: args.initial_timeout_ms,
+            idle_timeout_ms: args.idle_timeout_ms,
+        });
+        if let Some(config) = capture_config.as_ref() {
+            config.validate().map_err(mcp_invalid_params)?;
+        }
+
         // Get connection
         let connection = match self.connection_manager.get(&args.connection_id).await {
             Ok(conn) => conn,
@@ -455,20 +460,7 @@ impl SerialHandler {
         // Prepare buffer
         let mut buffer = vec![0u8; args.max_bytes];
 
-        if let Some(duration_ms) = args.duration_ms {
-            let timeout_ms = args
-                .timeout_ms
-                .unwrap_or(self.config.serial.default_timeout_ms);
-            let capture_config = CaptureConfig {
-                timeout_ms,
-                max_bytes: args.max_bytes,
-                duration_ms,
-                start_trigger: args.start_trigger,
-                initial_timeout_ms: args.initial_timeout_ms,
-                idle_timeout_ms: args.idle_timeout_ms,
-            };
-            capture_config.validate().map_err(mcp_error)?;
-
+        if let Some(capture_config) = capture_config {
             let report = connection
                 .capture(capture_config.clone())
                 .await
@@ -508,7 +500,7 @@ impl SerialHandler {
         }
 
         // Read data
-        match connection.read(&mut buffer, args.timeout_ms).await {
+        match connection.read(&mut buffer, Some(timeout_ms)).await {
             Ok(bytes_read) => {
                 buffer.truncate(bytes_read);
 
@@ -528,8 +520,7 @@ impl SerialHandler {
                         } else {
                             format!(
                                 "Read timeout\nConnection ID: {}\nTimeout: {}ms\nBytes read: 0",
-                                args.connection_id,
-                                args.timeout_ms.unwrap_or(1000)
+                                args.connection_id, timeout_ms
                             )
                         };
 
@@ -547,8 +538,7 @@ impl SerialHandler {
                     debug!("Read timeout on connection {}", args.connection_id);
                     let message = format!(
                         "Read timeout\nConnection ID: {}\nTimeout: {}ms\nBytes read: 0",
-                        args.connection_id,
-                        args.timeout_ms.unwrap_or(1000)
+                        args.connection_id, timeout_ms
                     );
                     Ok(CallToolResult::success(vec![Content::text(message)]))
                 }
@@ -618,6 +608,31 @@ fn mcp_error(error: impl std::fmt::Display) -> McpError {
     McpError::internal_error(error.to_string(), None)
 }
 
+fn mcp_invalid_params(error: impl std::fmt::Display) -> McpError {
+    McpError::invalid_params(error.to_string(), None)
+}
+
+fn validate_max_bytes(max_bytes: usize) -> Result<(), McpError> {
+    if max_bytes == 0 {
+        return Err(mcp_invalid_params("max_bytes must be greater than zero"));
+    }
+    if max_bytes > MAX_READ_BYTES {
+        return Err(mcp_invalid_params(format!(
+            "max_bytes must not exceed {MAX_READ_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_encoding(encoding: &str) -> Result<(), McpError> {
+    match encoding {
+        "utf8" | "utf-8" | "hex" | "base64" => Ok(()),
+        _ => Err(mcp_invalid_params(format!(
+            "Unsupported encoding: {encoding}"
+        ))),
+    }
+}
+
 /// Decode data to bytes array
 fn decode_data(data: &str, encoding: &str) -> Result<Vec<u8>, String> {
     match encoding {
@@ -626,6 +641,9 @@ fn decode_data(data: &str, encoding: &str) -> Result<Vec<u8>, String> {
             let data = data.trim().replace(' ', "");
             if data.len() & 1 != 0 {
                 return Err("Hex string must have even length".to_string());
+            }
+            if let Some(position) = data.bytes().position(|byte| !byte.is_ascii_hexdigit()) {
+                return Err(format!("Invalid hex character at position {position}"));
             }
 
             (0..data.len())
@@ -662,5 +680,247 @@ fn encode_data(data: &[u8], encoding: &str) -> Result<String, String> {
             Ok(general_purpose::STANDARD.encode(data))
         }
         _ => Err(format!("Unsupported encoding: {}", encoding)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serial::CaptureStartTrigger;
+
+    fn assert_invalid_params(error: McpError, expected_message: &str) {
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(error.message.as_ref(), expected_message);
+    }
+
+    fn open_args() -> OpenArgs {
+        OpenArgs {
+            port: "TEST".to_string(),
+            baud_rate: 19_200,
+            data_bits: "8".to_string(),
+            stop_bits: "1".to_string(),
+            parity: "none".to_string(),
+            flow_control: "none".to_string(),
+        }
+    }
+
+    fn read_args(max_bytes: usize) -> ReadArgs {
+        ReadArgs {
+            connection_id: "missing-connection".to_string(),
+            timeout_ms: None,
+            max_bytes,
+            encoding: "utf8".to_string(),
+            duration_ms: None,
+            start_trigger: CaptureStartTrigger::FirstByte,
+            initial_timeout_ms: None,
+            idle_timeout_ms: None,
+        }
+    }
+
+    fn write_args(data: &str, encoding: &str) -> WriteArgs {
+        WriteArgs {
+            connection_id: "missing-connection".to_string(),
+            data: data.to_string(),
+            encoding: encoding.to_string(),
+        }
+    }
+
+    #[test]
+    fn maximum_max_bytes_is_accepted() {
+        validate_max_bytes(MAX_READ_BYTES).expect("the documented limit must be accepted");
+    }
+
+    #[tokio::test]
+    async fn invalid_open_settings_are_reported_as_invalid_params() {
+        let handler = SerialHandler::new(Config::default());
+        let mut args = open_args();
+        args.parity = "mark".to_string();
+
+        let error = handler
+            .open(Parameters(args))
+            .await
+            .expect_err("invalid serial settings must be rejected before opening hardware");
+
+        assert_invalid_params(error, "Unsupported parity value: mark");
+    }
+
+    #[tokio::test]
+    async fn invalid_open_baud_rates_are_rejected_before_hardware_access() {
+        let handler = SerialHandler::new(Config::default());
+
+        for (baud_rate, expected_message) in [
+            (0, "baud_rate must be between 1 and 4000000 (got 0)"),
+            (
+                4_000_001,
+                "baud_rate must be between 1 and 4000000 (got 4000001)",
+            ),
+        ] {
+            let mut args = open_args();
+            args.baud_rate = baud_rate;
+
+            let error = handler
+                .open(Parameters(args))
+                .await
+                .expect_err("invalid baud rates must be rejected before opening hardware");
+
+            assert_invalid_params(error, expected_message);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_open_port_is_rejected_before_hardware_access() {
+        let handler = SerialHandler::new(Config::default());
+        let mut args = open_args();
+        args.port = "  ".to_string();
+
+        let error = handler
+            .open(Parameters(args))
+            .await
+            .expect_err("an empty port must be rejected before opening hardware");
+
+        assert_invalid_params(error, "port must not be empty");
+    }
+
+    #[tokio::test]
+    async fn invalid_max_bytes_is_rejected_before_connection_lookup() {
+        let handler = SerialHandler::new(Config::default());
+
+        for (max_bytes, expected_message) in [
+            (0, "max_bytes must be greater than zero".to_string()),
+            (
+                MAX_READ_BYTES + 1,
+                format!("max_bytes must not exceed {MAX_READ_BYTES}"),
+            ),
+        ] {
+            let error = handler
+                .read(Parameters(read_args(max_bytes)))
+                .await
+                .expect_err("invalid reads must be rejected before connection lookup");
+
+            assert_invalid_params(error, &expected_message);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_capture_settings_are_reported_as_invalid_params() {
+        let handler = SerialHandler::new(Config::default());
+        let mut args = read_args(1);
+        args.duration_ms = Some(0);
+
+        let error = handler
+            .read(Parameters(args))
+            .await
+            .expect_err("invalid capture settings must be rejected before connection lookup");
+
+        assert_invalid_params(
+            error,
+            "Invalid configuration: duration_ms must be greater than zero",
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_read_encoding_is_rejected_before_connection_lookup() {
+        let handler = SerialHandler::new(Config::default());
+        let mut args = read_args(1);
+        args.encoding = "binary".to_string();
+        args.duration_ms = Some(100);
+
+        let error = handler
+            .read(Parameters(args))
+            .await
+            .expect_err("encoding must be validated before lookup or FIFO consumption");
+
+        assert_invalid_params(error, "Unsupported encoding: binary");
+    }
+
+    #[tokio::test]
+    async fn invalid_write_payloads_are_rejected_before_connection_lookup() {
+        let handler = SerialHandler::new(Config::default());
+
+        for (args, expected_message) in [
+            (
+                write_args("payload", "binary"),
+                "Unsupported encoding: binary",
+            ),
+            (write_args("0", "hex"), "Hex string must have even length"),
+            (
+                write_args("GG", "hex"),
+                "Invalid hex character at position 0",
+            ),
+            (
+                write_args("😀", "hex"),
+                "Invalid hex character at position 0",
+            ),
+        ] {
+            let error = handler
+                .write(Parameters(args))
+                .await
+                .expect_err("invalid payloads must be rejected before connection lookup");
+
+            assert_invalid_params(error, expected_message);
+        }
+
+        let error = handler
+            .write(Parameters(write_args("***", "base64")))
+            .await
+            .expect_err("invalid base64 must be rejected before connection lookup");
+        assert_invalid_params(error, "Invalid base64: Invalid symbol 42, offset 0.");
+    }
+
+    #[tokio::test]
+    async fn empty_control_line_update_is_rejected_before_connection_lookup() {
+        let handler = SerialHandler::new(Config::default());
+        let args = SetControlLinesArgs {
+            connection_id: "missing-connection".to_string(),
+            rts: None,
+            dtr: None,
+        };
+
+        let error = handler
+            .set_control_lines(Parameters(args))
+            .await
+            .expect_err("empty updates must be rejected before connection lookup");
+
+        assert_invalid_params(error, "At least one of 'rts' or 'dtr' must be specified");
+    }
+
+    #[tokio::test]
+    async fn connection_lookup_failures_remain_internal_errors() {
+        let handler = SerialHandler::new(Config::default());
+
+        let read_error = handler
+            .read(Parameters(read_args(1)))
+            .await
+            .expect_err("a missing connection must fail at runtime");
+
+        assert_eq!(read_error.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            read_error.message.as_ref(),
+            "Error: Connection ID missing-connection not found"
+        );
+
+        let write_error = handler
+            .write(Parameters(write_args("valid", "utf8")))
+            .await
+            .expect_err("a missing connection must fail at runtime");
+        assert_eq!(write_error.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            write_error.message.as_ref(),
+            "Error: Connection ID missing-connection not found"
+        );
+
+        let control_error = handler
+            .set_control_lines(Parameters(SetControlLinesArgs {
+                connection_id: "missing-connection".to_string(),
+                rts: Some(true),
+                dtr: None,
+            }))
+            .await
+            .expect_err("a missing connection must fail at runtime");
+        assert_eq!(control_error.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            control_error.message.as_ref(),
+            "Error: Connection ID missing-connection not found"
+        );
     }
 }

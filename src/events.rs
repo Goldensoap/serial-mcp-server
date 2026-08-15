@@ -7,10 +7,11 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::net::UdpSocket;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+#[cfg(not(test))]
+use std::{fs, fs::OpenOptions, io::Write, net::UdpSocket};
 use uuid::Uuid;
 
 pub const EVENT_SCHEMA_VERSION: u8 = 1;
@@ -123,8 +124,9 @@ impl SerialEvent {
 }
 
 /// Publish an event without allowing telemetry failures to affect serial I/O.
+#[cfg(not(test))]
 pub fn publish(event: SerialEvent) {
-    let Ok(serialized) = serde_json::to_vec(&event) else {
+    let Ok(mut serialized) = serde_json::to_vec(&event) else {
         return;
     };
 
@@ -137,14 +139,21 @@ pub fn publish(event: SerialEvent) {
         .append(true)
         .open(event_log_path())
     {
+        serialized.push(b'\n');
         let _ = file.write_all(&serialized);
-        let _ = file.write_all(b"\n");
+        serialized.pop();
     }
 
     if let Ok(socket) = UdpSocket::bind("127.0.0.1:0") {
         let _ = socket.send_to(&serialized, event_address());
     }
 }
+
+/// Unit tests in the library must not write to a user's journal or UDP socket.
+/// Integration tests compile the library without `cfg(test)` and exercise the
+/// real publisher above.
+#[cfg(test)]
+pub fn publish(_event: SerialEvent) {}
 
 pub fn event_address() -> String {
     std::env::var(EVENT_ADDRESS_ENV).unwrap_or_else(|_| DEFAULT_EVENT_ADDRESS.to_string())
@@ -213,6 +222,7 @@ fn load_history_from(path: &Path, limit: usize) -> std::io::Result<Vec<SerialEve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use tempfile::NamedTempFile;
 
     #[test]

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{AutomationError, AutomationResult};
+use super::{limits::max_bytes_error, AutomationError, AutomationResult};
 use crate::broker::BrokerSerialConnection;
 use crate::serial::LocalSerialError;
 
@@ -33,6 +33,9 @@ impl MacroTransport for SerialMacroTransport {
     }
 
     async fn read(&mut self, max_bytes: usize, timeout_ms: u64) -> AutomationResult<Vec<u8>> {
+        if let Some(message) = max_bytes_error(max_bytes) {
+            return Err(AutomationError::Transport(message));
+        }
         let mut buffer = vec![0_u8; max_bytes];
         match self.connection.read(&mut buffer, Some(timeout_ms)).await {
             Ok(bytes_read) => {

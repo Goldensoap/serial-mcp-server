@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use tokio::task::JoinHandle;
 
 use crate::events::{self, publish, EventContext, SerialEvent};
 use crate::serial::capture::{capture_with_reader, CaptureReader};
@@ -24,12 +25,33 @@ use crate::serial::{
 
 pub const DEFAULT_BROKER_ADDRESS: &str = "127.0.0.1:47832";
 pub const BROKER_ADDRESS_ENV: &str = "SERIAL_MCP_BROKER_ADDR";
+pub const MAX_READ_BYTES: usize = 65_536;
 const SHARED_RX_CAPACITY: usize = 1024 * 1024;
+const CONNECTION_OPERATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const READER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn max_bytes_error(max_bytes: usize) -> Option<&'static str> {
+    if max_bytes == 0 {
+        Some("max_bytes must be greater than zero")
+    } else if max_bytes > MAX_READ_BYTES {
+        Some("max_bytes must not exceed 65536")
+    } else {
+        None
+    }
+}
 
 struct BrokerState {
     connections: ConnectionManager,
     receive_buffers: RwLock<HashMap<String, Arc<SharedReceiveBuffer>>>,
+    reader_tasks: RwLock<HashMap<String, JoinHandle<()>>>,
+    operation_gates: RwLock<HashMap<String, Arc<RwLock<ConnectionLifecycle>>>>,
     open_lock: Mutex<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionLifecycle {
+    Open,
+    Closed,
 }
 
 impl BrokerState {
@@ -37,6 +59,8 @@ impl BrokerState {
         Self {
             connections: ConnectionManager::new(),
             receive_buffers: RwLock::new(HashMap::new()),
+            reader_tasks: RwLock::new(HashMap::new()),
+            operation_gates: RwLock::new(HashMap::new()),
             open_lock: Mutex::new(()),
         }
     }
@@ -45,12 +69,56 @@ impl BrokerState {
         &self,
         connection_id: &str,
     ) -> Result<Arc<SharedReceiveBuffer>, LocalSerialError> {
+        if let Some(buffer) = self
+            .receive_buffers
+            .read()
+            .await
+            .get(connection_id)
+            .cloned()
+        {
+            return Ok(buffer);
+        }
+
+        // An open request publishes the manager entry before it finishes
+        // registering the shared buffer. Waiting for open/close serialization
+        // removes that short initialization race before reporting an invalid ID.
+        let _open_guard = self.open_lock.lock().await;
         self.receive_buffers
             .read()
             .await
             .get(connection_id)
             .cloned()
             .ok_or_else(|| LocalSerialError::InvalidConnection(connection_id.to_string()))
+    }
+
+    async fn operation_gate(
+        &self,
+        connection_id: &str,
+    ) -> Result<Arc<RwLock<ConnectionLifecycle>>, LocalSerialError> {
+        if let Some(gate) = self
+            .operation_gates
+            .read()
+            .await
+            .get(connection_id)
+            .cloned()
+        {
+            return Ok(gate);
+        }
+
+        let _open_guard = self.open_lock.lock().await;
+        self.operation_gates
+            .read()
+            .await
+            .get(connection_id)
+            .cloned()
+            .ok_or_else(|| LocalSerialError::InvalidConnection(connection_id.to_string()))
+    }
+
+    async fn begin_operation(
+        &self,
+        connection_id: &str,
+    ) -> Result<OwnedRwLockReadGuard<ConnectionLifecycle>, LocalSerialError> {
+        begin_operation(self.operation_gate(connection_id).await?, connection_id).await
     }
 }
 
@@ -69,8 +137,11 @@ impl SharedReceiveBuffer {
         }
     }
 
-    async fn push(&self, bytes: &[u8]) {
+    async fn push(&self, bytes: &[u8]) -> bool {
         let mut data = self.data.lock().await;
+        if !self.active.load(Ordering::Acquire) {
+            return false;
+        }
         let overflow = data
             .len()
             .saturating_add(bytes.len())
@@ -82,6 +153,7 @@ impl SharedReceiveBuffer {
         data.extend(bytes);
         drop(data);
         self.notify.notify_waiters();
+        true
     }
 
     async fn read(&self, max_bytes: usize, timeout_ms: u64) -> Result<Vec<u8>, LocalSerialError> {
@@ -90,16 +162,15 @@ impl SharedReceiveBuffer {
             let notified = self.notify.notified();
             {
                 let mut data = self.data.lock().await;
+                if !self.active.load(Ordering::Acquire) {
+                    return Err(LocalSerialError::InvalidConnection(
+                        "Shared connection is closed".to_string(),
+                    ));
+                }
                 if !data.is_empty() {
                     let length = max_bytes.min(data.len());
                     return Ok(data.drain(..length).collect());
                 }
-            }
-
-            if !self.active.load(Ordering::Acquire) {
-                return Err(LocalSerialError::InvalidConnection(
-                    "Shared connection is closed".to_string(),
-                ));
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
                 return Err(LocalSerialError::ReadTimeout);
@@ -107,10 +178,36 @@ impl SharedReceiveBuffer {
         }
     }
 
-    fn close(&self) {
+    async fn close(&self) {
+        let mut data = self.data.lock().await;
         self.active.store(false, Ordering::Release);
+        data.clear();
+        drop(data);
         self.notify.notify_waiters();
     }
+}
+
+async fn begin_operation(
+    gate: Arc<RwLock<ConnectionLifecycle>>,
+    connection_id: &str,
+) -> Result<OwnedRwLockReadGuard<ConnectionLifecycle>, LocalSerialError> {
+    let lifecycle = gate.read_owned().await;
+    if *lifecycle == ConnectionLifecycle::Open {
+        Ok(lifecycle)
+    } else {
+        Err(LocalSerialError::InvalidConnection(format!(
+            "Connection {connection_id} is closing or closed"
+        )))
+    }
+}
+
+async fn begin_close(
+    gate: Arc<RwLock<ConnectionLifecycle>>,
+    timeout: Duration,
+) -> Result<OwnedRwLockWriteGuard<ConnectionLifecycle>, ()> {
+    tokio::time::timeout(timeout, gate.write_owned())
+        .await
+        .map_err(|_| ())
 }
 
 struct SharedBufferCaptureReader {
@@ -484,21 +581,72 @@ async fn handle_request(request: BrokerRequest, state: &BrokerState) -> BrokerRe
             Ok(ports) => BrokerResponse::success(ports),
             Err(error) => BrokerResponse::failure("serial_error", error.to_string()),
         },
-        BrokerRequest::ListConnections => BrokerResponse::success(state.connections.list().await),
+        BrokerRequest::ListConnections => {
+            // SerialConnection publishes OPENED while open_shared_connection
+            // still owns this lock. Waiting here makes that event and the
+            // fully initialized buffer/gate/reader atomically discoverable.
+            let _open_guard = state.open_lock.lock().await;
+            BrokerResponse::success(state.connections.list().await)
+        }
         BrokerRequest::Open { config } => open_shared_connection(state, config).await,
         BrokerRequest::Close { connection_id } => {
-            match state.connections.close(&connection_id).await {
-                Ok(()) => {
-                    if let Some(buffer) = state.receive_buffers.write().await.remove(&connection_id)
-                    {
-                        buffer.close();
-                    }
-                    BrokerResponse::success(())
+            let _open_guard = state.open_lock.lock().await;
+            let operation_gate = match state
+                .operation_gates
+                .read()
+                .await
+                .get(&connection_id)
+                .cloned()
+            {
+                Some(gate) => gate,
+                None => {
+                    return BrokerResponse::serial_error(LocalSerialError::InvalidConnection(
+                        connection_id,
+                    ))
                 }
-                Err(error) => BrokerResponse::serial_error(error),
+            };
+            let mut lifecycle =
+                match begin_close(operation_gate, CONNECTION_OPERATION_DRAIN_TIMEOUT).await {
+                    Ok(lifecycle) => lifecycle,
+                    Err(()) => {
+                        let message = format!(
+                        "Timed out waiting for in-flight operations on connection {connection_id}"
+                    );
+                        return BrokerResponse::failure("connection_busy", message);
+                    }
+                };
+            if *lifecycle != ConnectionLifecycle::Open {
+                return BrokerResponse::serial_error(LocalSerialError::InvalidConnection(
+                    connection_id,
+                ));
             }
+            *lifecycle = ConnectionLifecycle::Closed;
+
+            let receive_buffer = { state.receive_buffers.write().await.remove(&connection_id) };
+            if let Some(buffer) = receive_buffer {
+                buffer.close().await;
+            }
+            // The background reader takes a shared lifecycle guard for each
+            // physical read. Release the exclusive guard after marking the
+            // connection closed so it can observe that state and exit.
+            drop(lifecycle);
+            let reader_task = { state.reader_tasks.write().await.remove(&connection_id) };
+            if let Some(reader_task) = reader_task {
+                stop_reader_task(reader_task, READER_TASK_SHUTDOWN_TIMEOUT).await;
+            }
+
+            let response = match state.connections.close(&connection_id).await {
+                Ok(()) => BrokerResponse::success(()),
+                Err(error) => BrokerResponse::serial_error(error),
+            };
+            state.operation_gates.write().await.remove(&connection_id);
+            response
         }
         BrokerRequest::Status { connection_id } => {
+            let _operation = match state.begin_operation(&connection_id).await {
+                Ok(operation) => operation,
+                Err(error) => return BrokerResponse::serial_error(error),
+            };
             match state.connections.get(&connection_id).await {
                 Ok(connection) => BrokerResponse::success(connection.status().await),
                 Err(error) => BrokerResponse::serial_error(error),
@@ -507,60 +655,89 @@ async fn handle_request(request: BrokerRequest, state: &BrokerState) -> BrokerRe
         BrokerRequest::Write {
             connection_id,
             data,
-        } => match state.connections.get(&connection_id).await {
-            Ok(connection) => match connection.write(&data).await {
-                Ok(bytes) => BrokerResponse::success(bytes),
+        } => {
+            let _operation = match state.begin_operation(&connection_id).await {
+                Ok(operation) => operation,
+                Err(error) => return BrokerResponse::serial_error(error),
+            };
+            match state.connections.get(&connection_id).await {
+                Ok(connection) => match connection.write(&data).await {
+                    Ok(bytes) => BrokerResponse::success(bytes),
+                    Err(error) => BrokerResponse::serial_error(error),
+                },
                 Err(error) => BrokerResponse::serial_error(error),
-            },
-            Err(error) => BrokerResponse::serial_error(error),
-        },
+            }
+        }
         BrokerRequest::Read {
             connection_id,
             timeout_ms,
             max_bytes,
-        } => match state.receive_buffer(&connection_id).await {
-            Ok(buffer) => match buffer
-                .read(max_bytes.clamp(1, 65_536), timeout_ms.unwrap_or(1_000))
-                .await
-            {
-                Ok(data) => BrokerResponse::success(data),
+        } => {
+            if let Some(error) = max_bytes_error(max_bytes) {
+                return BrokerResponse::failure("invalid_config", error);
+            }
+            match state.receive_buffer(&connection_id).await {
+                Ok(buffer) => match buffer.read(max_bytes, timeout_ms.unwrap_or(1_000)).await {
+                    Ok(data) => BrokerResponse::success(data),
+                    Err(error) => BrokerResponse::serial_error(error),
+                },
                 Err(error) => BrokerResponse::serial_error(error),
-            },
-            Err(error) => BrokerResponse::serial_error(error),
-        },
+            }
+        }
         BrokerRequest::Capture {
             connection_id,
             config,
-        } => match state.receive_buffer(&connection_id).await {
-            Ok(buffer) => {
-                let mut reader = SharedBufferCaptureReader { buffer };
-                match capture_with_reader(&mut reader, config).await {
-                    Ok(report) => BrokerResponse::success(report),
-                    Err(error) => BrokerResponse::serial_error(error),
-                }
+        } => {
+            if let Some(error) = max_bytes_error(config.max_bytes) {
+                return BrokerResponse::failure("invalid_config", error);
             }
-            Err(error) => BrokerResponse::serial_error(error),
-        },
+            match state.receive_buffer(&connection_id).await {
+                Ok(buffer) => {
+                    let mut reader = SharedBufferCaptureReader { buffer };
+                    match capture_with_reader(&mut reader, config).await {
+                        Ok(report) => BrokerResponse::success(report),
+                        Err(error) => BrokerResponse::serial_error(error),
+                    }
+                }
+                Err(error) => BrokerResponse::serial_error(error),
+            }
+        }
         BrokerRequest::SetControlLines {
             connection_id,
             rts,
             dtr,
-        } => match state.connections.get(&connection_id).await {
-            Ok(connection) => {
-                if let Some(level) = rts {
-                    if let Err(error) = connection.set_rts(level).await {
-                        return BrokerResponse::serial_error(error);
+        } => {
+            let _operation = match state.begin_operation(&connection_id).await {
+                Ok(operation) => operation,
+                Err(error) => return BrokerResponse::serial_error(error),
+            };
+            match state.connections.get(&connection_id).await {
+                Ok(connection) => {
+                    if let Some(level) = rts {
+                        if let Err(error) = connection.set_rts(level).await {
+                            return BrokerResponse::serial_error(error);
+                        }
                     }
-                }
-                if let Some(level) = dtr {
-                    if let Err(error) = connection.set_dtr(level).await {
-                        return BrokerResponse::serial_error(error);
+                    if let Some(level) = dtr {
+                        if let Err(error) = connection.set_dtr(level).await {
+                            return BrokerResponse::serial_error(error);
+                        }
                     }
+                    BrokerResponse::success(())
                 }
-                BrokerResponse::success(())
+                Err(error) => BrokerResponse::serial_error(error),
             }
-            Err(error) => BrokerResponse::serial_error(error),
-        },
+        }
+    }
+}
+
+async fn stop_reader_task(mut reader_task: JoinHandle<()>, timeout: Duration) {
+    if tokio::time::timeout(timeout, &mut reader_task)
+        .await
+        .is_err()
+    {
+        reader_task.abort();
+        let _ = reader_task.await;
     }
 }
 
@@ -599,7 +776,18 @@ async fn open_shared_connection(state: &BrokerState, config: ConnectionConfig) -
                 .write()
                 .await
                 .insert(connection_id.clone(), Arc::clone(&receive_buffer));
-            start_shared_reader(connection, receive_buffer);
+            let operation_gate = Arc::new(RwLock::new(ConnectionLifecycle::Open));
+            state
+                .operation_gates
+                .write()
+                .await
+                .insert(connection_id.clone(), Arc::clone(&operation_gate));
+            let reader_task = start_shared_reader(connection, receive_buffer, operation_gate);
+            state
+                .reader_tasks
+                .write()
+                .await
+                .insert(connection_id.clone(), reader_task);
             BrokerResponse::success(connection_id)
         }
         Err(error) => BrokerResponse::serial_error(error),
@@ -609,7 +797,8 @@ async fn open_shared_connection(state: &BrokerState, config: ConnectionConfig) -
 fn start_shared_reader(
     connection: Arc<SerialConnection>,
     receive_buffer: Arc<SharedReceiveBuffer>,
-) {
+    operation_gate: Arc<RwLock<ConnectionLifecycle>>,
+) -> JoinHandle<()> {
     let connection_id = connection.id().to_string();
     tokio::spawn(events::with_event_context(
         EventContext {
@@ -619,27 +808,33 @@ fn start_shared_reader(
         async move {
             let status = connection.status().await;
             let mut buffer = vec![0_u8; 4096];
-            while receive_buffer.active.load(Ordering::Acquire) {
+            loop {
+                let _operation =
+                    match begin_operation(Arc::clone(&operation_gate), &connection_id).await {
+                        Ok(operation) => operation,
+                        Err(_) => break,
+                    };
                 match connection.read_unobserved(&mut buffer, Some(100)).await {
                     Ok(bytes) if bytes > 0 => {
-                        receive_buffer.push(&buffer[..bytes]).await;
-                        publish(
-                            SerialEvent::new(
-                                "serial.rx",
-                                format!("Received {bytes} bytes from device"),
+                        if receive_buffer.push(&buffer[..bytes]).await {
+                            publish(
+                                SerialEvent::new(
+                                    "serial.rx",
+                                    format!("Received {bytes} bytes from device"),
+                                )
+                                .connection(connection_id.clone())
+                                .port(status.port.clone())
+                                .direction("rx")
+                                .data(&buffer[..bytes]),
                             )
-                            .connection(connection_id.clone())
-                            .port(status.port.clone())
-                            .direction("rx")
-                            .data(&buffer[..bytes]),
-                        );
+                        }
                     }
                     Ok(_) | Err(LocalSerialError::ReadTimeout) => {}
                     Err(_) => break,
                 }
             }
         },
-    ));
+    ))
 }
 
 fn map_broker_error(error: Option<BrokerError>) -> LocalSerialError {
@@ -651,6 +846,7 @@ fn map_broker_error(error: Option<BrokerError>) -> LocalSerialError {
         "read_timeout" => LocalSerialError::ReadTimeout,
         "invalid_connection" => LocalSerialError::InvalidConnection(error.message),
         "connection_exists" => LocalSerialError::ConnectionExists(error.message),
+        "connection_busy" => LocalSerialError::ConnectionFailed(error.message),
         "invalid_baud_rate" => LocalSerialError::InvalidConfig(error.message),
         _ => LocalSerialError::InvalidConfig(error.message),
     }
@@ -665,6 +861,14 @@ fn broker_io_error(address: &str, error: std::io::Error) -> LocalSerialError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
 
     #[test]
     fn broker_protocol_round_trips_source_context() {
@@ -701,11 +905,120 @@ mod tests {
             tokio::spawn(async move { buffer.read(10, 10_000).await })
         };
         tokio::task::yield_now().await;
-        buffer.close();
+        buffer.close().await;
 
         assert!(matches!(
             waiting.await.unwrap(),
             Err(LocalSerialError::InvalidConnection(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn closing_shared_buffer_discards_unconsumed_bytes() {
+        let buffer = SharedReceiveBuffer::new();
+        assert!(buffer.push(b"stale").await);
+        buffer.close().await;
+
+        assert!(matches!(
+            buffer.read(5, 10).await,
+            Err(LocalSerialError::InvalidConnection(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_gate_waits_for_in_flight_operation_and_rejects_late_operations() {
+        let gate = Arc::new(RwLock::new(ConnectionLifecycle::Open));
+        let operation = begin_operation(Arc::clone(&gate), "connection")
+            .await
+            .unwrap();
+        let close_started = Arc::new(Notify::new());
+        let close_finished = Arc::new(AtomicBool::new(false));
+        let closing = {
+            let gate = Arc::clone(&gate);
+            let close_started = Arc::clone(&close_started);
+            let close_finished = Arc::clone(&close_finished);
+            tokio::spawn(async move {
+                close_started.notify_one();
+                let mut lifecycle = begin_close(gate, Duration::from_secs(1))
+                    .await
+                    .expect("close should acquire the gate after the operation finishes");
+                *lifecycle = ConnectionLifecycle::Closed;
+                close_finished.store(true, Ordering::Release);
+            })
+        };
+        close_started.notified().await;
+        tokio::task::yield_now().await;
+        assert!(!close_finished.load(Ordering::Acquire));
+
+        drop(operation);
+        closing.await.unwrap();
+        assert!(close_finished.load(Ordering::Acquire));
+        assert!(matches!(
+            begin_operation(gate, "connection").await,
+            Err(LocalSerialError::InvalidConnection(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_gate_timeout_preserves_open_connection_state() {
+        let gate = Arc::new(RwLock::new(ConnectionLifecycle::Open));
+        let operation = begin_operation(Arc::clone(&gate), "connection")
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            assert!(begin_close(Arc::clone(&gate), Duration::from_millis(10))
+                .await
+                .is_err());
+        })
+        .await
+        .expect("a busy close must return within its deadline");
+
+        drop(operation);
+        begin_operation(gate, "connection")
+            .await
+            .expect("a timed-out close must leave the connection open");
+    }
+
+    #[test]
+    fn broker_read_size_validation_enforces_protocol_bounds() {
+        assert_eq!(
+            max_bytes_error(0),
+            Some("max_bytes must be greater than zero")
+        );
+        assert_eq!(max_bytes_error(1), None);
+        assert_eq!(max_bytes_error(MAX_READ_BYTES), None);
+        assert_eq!(
+            max_bytes_error(MAX_READ_BYTES + 1),
+            Some("max_bytes must not exceed 65536")
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_task_shutdown_aborts_and_reaps_a_stuck_task() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Notify::new());
+        let reader_task = {
+            let dropped = Arc::clone(&dropped);
+            let started = Arc::clone(&started);
+            tokio::spawn(async move {
+                let _drop_signal = DropSignal(dropped);
+                started.notify_one();
+                std::future::pending::<()>().await;
+            })
+        };
+        started.notified().await;
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            stop_reader_task(reader_task, Duration::from_millis(10)),
+        )
+        .await
+        .expect("stuck reader task should be aborted within the shutdown deadline");
+
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "aborted reader task should be awaited and dropped"
+        );
     }
 }

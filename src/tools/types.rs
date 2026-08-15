@@ -13,7 +13,9 @@ pub struct ListPortsArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct OpenArgs {
+    #[schemars(length(min = 1))]
     pub port: String,
+    #[schemars(range(min = 1, max = 4_000_000))]
     pub baud_rate: u32,
     #[serde(default = "default_data_bits")]
     pub data_bits: String,
@@ -61,6 +63,7 @@ pub struct ReadArgs {
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     #[serde(default = "default_max_bytes")]
+    #[schemars(range(min = 1, max = 65536))]
     pub max_bytes: usize,
     #[serde(default = "default_encoding")]
     pub encoding: String,
@@ -310,45 +313,136 @@ pub fn decode_data(data: &str, encoding: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-impl From<OpenArgs> for ConnectionConfig {
-    fn from(args: OpenArgs) -> Self {
+impl TryFrom<OpenArgs> for ConnectionConfig {
+    type Error = String;
+
+    fn try_from(args: OpenArgs) -> Result<Self, Self::Error> {
         use crate::serial::{DataBits, FlowControl, Parity, StopBits};
+
+        if args.port.trim().is_empty() {
+            return Err("port must not be empty".to_string());
+        }
+
+        if !(1..=4_000_000).contains(&args.baud_rate) {
+            return Err(format!(
+                "baud_rate must be between 1 and 4000000 (got {})",
+                args.baud_rate
+            ));
+        }
 
         let data_bits = match args.data_bits.as_str() {
             "5" => DataBits::Five,
             "6" => DataBits::Six,
             "7" => DataBits::Seven,
             "8" => DataBits::Eight,
-            _ => DataBits::Eight,
+            value => return Err(format!("Unsupported data_bits value: {value}")),
         };
 
         let stop_bits = match args.stop_bits.as_str() {
             "1" => StopBits::One,
             "2" => StopBits::Two,
-            _ => StopBits::One,
+            value => return Err(format!("Unsupported stop_bits value: {value}")),
         };
 
         let parity = match args.parity.to_lowercase().as_str() {
             "none" => Parity::None,
             "odd" => Parity::Odd,
             "even" => Parity::Even,
-            _ => Parity::None,
+            value => return Err(format!("Unsupported parity value: {value}")),
         };
 
         let flow_control = match args.flow_control.to_lowercase().as_str() {
             "none" => FlowControl::None,
             "software" => FlowControl::Software,
             "hardware" => FlowControl::Hardware,
-            _ => FlowControl::None,
+            value => return Err(format!("Unsupported flow_control value: {value}")),
         };
 
-        ConnectionConfig {
+        Ok(ConnectionConfig {
             port: args.port,
             baud_rate: args.baud_rate,
             data_bits,
             stop_bits,
             parity,
             flow_control,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_args() -> OpenArgs {
+        OpenArgs {
+            port: "TEST".to_string(),
+            baud_rate: 19_200,
+            data_bits: "8".to_string(),
+            stop_bits: "1".to_string(),
+            parity: "none".to_string(),
+            flow_control: "none".to_string(),
         }
+    }
+
+    #[test]
+    fn open_args_reject_invalid_serial_settings() {
+        for (field, value) in [
+            ("data_bits", "9"),
+            ("stop_bits", "3"),
+            ("parity", "mark"),
+            ("flow_control", "invalid"),
+        ] {
+            let mut args = open_args();
+            match field {
+                "data_bits" => args.data_bits = value.to_string(),
+                "stop_bits" => args.stop_bits = value.to_string(),
+                "parity" => args.parity = value.to_string(),
+                "flow_control" => args.flow_control = value.to_string(),
+                _ => unreachable!(),
+            }
+
+            let error = ConnectionConfig::try_from(args).expect_err("invalid setting");
+            assert!(
+                error.contains(value),
+                "unexpected validation error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_args_enforce_supported_baud_rate_range() {
+        for (baud_rate, expected) in [
+            (0, "baud_rate must be between 1 and 4000000 (got 0)"),
+            (
+                4_000_001,
+                "baud_rate must be between 1 and 4000000 (got 4000001)",
+            ),
+        ] {
+            let mut args = open_args();
+            args.baud_rate = baud_rate;
+
+            let error = ConnectionConfig::try_from(args).expect_err("invalid baud rate");
+            assert_eq!(error, expected);
+        }
+
+        let mut args = open_args();
+        args.baud_rate = 4_000_000;
+        assert_eq!(
+            ConnectionConfig::try_from(args)
+                .expect("upper boundary must be accepted")
+                .baud_rate,
+            4_000_000
+        );
+    }
+
+    #[test]
+    fn open_args_reject_empty_port() {
+        let mut args = open_args();
+        args.port = "  ".to_string();
+
+        assert_eq!(
+            ConnectionConfig::try_from(args).expect_err("empty port"),
+            "port must not be empty"
+        );
     }
 }

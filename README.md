@@ -73,7 +73,12 @@ Shared behavior:
 - Port-based CLI commands reuse an existing connection with matching settings.
 - A client exiting does not close the shared port; only an explicit `close` or broker-owner exit releases it.
 - One broker read loop owns physical RX. GUI receives live RX events without polling away bytes that MCP or CLI needs to consume.
-- TX, RX, connection, and control-line events carry the requesting source and PID.
+- MCP and CLI readers share one bounded, destructive RX FIFO. Bytes returned to
+  one reader are not replayed to another reader; GUI observation remains
+  independent through the event stream.
+- Request-originated invocation, TX, connection, and control-line events carry
+  the requesting source and PID. Physical RX events use source `device` and the
+  broker-owner PID.
 
 The broker defaults to `127.0.0.1:47832` and can be changed with `SERIAL_MCP_BROKER_ADDR`. UDP events default to `127.0.0.1:47831` and can be changed with `SERIAL_MCP_EVENT_ADDR`. See [`gui/README.md`](gui/README.md) for development and acceptance steps.
 
@@ -140,7 +145,8 @@ Capture options:
   If omitted, the command uses `--timeout-ms`.
 - `--idle-timeout-ms`: stop after this many quiet milliseconds once capture has
   started.
-- `--max-bytes`: hard cap on the combined response bytes.
+- `--max-bytes`: hard cap on the combined response bytes; valid range is
+  1 through 65,536.
 
 `write --read` accepts the same capture options after the write:
 
@@ -259,6 +265,9 @@ MCP `read` accepts these optional capture fields in addition to
   "encoding": "utf8"
 }
 ```
+
+`max_bytes` must be between 1 and 65,536 for direct reads, capture windows,
+and macro `expect` steps.
 
 When `duration_ms` is absent, MCP `read` keeps the existing single-read
 behavior. When `duration_ms` is present, the tool returns structured JSON text

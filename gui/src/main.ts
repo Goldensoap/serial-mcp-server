@@ -240,30 +240,34 @@ app.innerHTML = `
   <div class="toast-region" id="toast-region"></div>
 `;
 
-createIcons({
-  icons: {
-    Activity,
-    Bot,
-    Cable,
-    ChevronDown,
-    CircleStop,
-    Cpu,
-    Eraser,
-    Eye,
-    EyeOff,
-    Gauge,
-    MonitorUp,
-    Pause,
-    Play,
-    Plug,
-    Radio,
-    RefreshCw,
-    Send,
-    Settings2,
-    TerminalSquare,
-    Unplug,
-  },
-});
+const iconSet = {
+  Activity,
+  Bot,
+  Cable,
+  ChevronDown,
+  CircleStop,
+  Cpu,
+  Eraser,
+  Eye,
+  EyeOff,
+  Gauge,
+  MonitorUp,
+  Pause,
+  Play,
+  Plug,
+  Radio,
+  RefreshCw,
+  Send,
+  Settings2,
+  TerminalSquare,
+  Unplug,
+};
+
+function renderIcons(root: Element | Document | DocumentFragment = document): void {
+  createIcons({ icons: iconSet, root });
+}
+
+renderIcons();
 
 const terminal = byId("terminal");
 const eventList = byId("event-list");
@@ -409,13 +413,14 @@ function renderConnections(): void {
               <span class="connection-live"></span>
             </button>
             <button class="disconnect-button" data-close-id="${escapeHtml(connection.id)}" title="关闭共享连接"><i data-lucide="unplug"></i></button>
+            <code class="connection-id" title="connection_id: ${escapeHtml(connection.id)}" aria-label="connection ID ${escapeHtml(connection.id)}">${escapeHtml(connection.id)}</code>
           </div>`;
       })
       .join("");
   }
   const selected = state.mirroredConnections.get(state.selectedConnectionId);
   byId("send-target").textContent = selected && state.sharedConnectionIds.has(selected.id) ? selected.port : "未选择共享连接";
-  createIcons({ icons: { Bot, Plug, Radio, Unplug } });
+  renderIcons(list);
 }
 
 function renderStats(): void {
@@ -438,7 +443,8 @@ function renderActivityFeed(): void {
     .filter((event) => event.source === "mcp" || event.source === "cli")
     .slice(-8)
     .reverse();
-  byId("activity-feed").innerHTML = activity.length
+  const feed = byId("activity-feed");
+  feed.innerHTML = activity.length
     ? activity
         .map(
           (event) => `
@@ -449,7 +455,7 @@ function renderActivityFeed(): void {
         )
         .join("")
     : `<div class="empty-activity">外部 MCP / CLI 操作将显示在此处</div>`;
-  createIcons({ icons: { Bot, TerminalSquare } });
+  renderIcons(feed);
 }
 
 async function refreshPorts(): Promise<void> {
@@ -589,16 +595,18 @@ function bindUi(): void {
 
   byId("pause-button").addEventListener("click", () => {
     state.paused = !state.paused;
-    byId("pause-button").classList.toggle("active", state.paused);
-    byId("pause-button").innerHTML = `<i data-lucide="${state.paused ? "play" : "pause"}"></i>`;
-    createIcons({ icons: { Pause, Play } });
+    const pauseButton = byId("pause-button");
+    pauseButton.classList.toggle("active", state.paused);
+    pauseButton.innerHTML = `<i data-lucide="${state.paused ? "play" : "pause"}"></i>`;
+    renderIcons(pauseButton);
     if (!state.paused) renderAll();
   });
   byId("scroll-button").addEventListener("click", () => {
     state.autoScroll = !state.autoScroll;
-    byId("scroll-button").classList.toggle("active", !state.autoScroll);
-    byId("scroll-button").innerHTML = `<i data-lucide="${state.autoScroll ? "eye" : "eye-off"}"></i>`;
-    createIcons({ icons: { Eye, EyeOff } });
+    const scrollButton = byId("scroll-button");
+    scrollButton.classList.toggle("active", !state.autoScroll);
+    scrollButton.innerHTML = `<i data-lucide="${state.autoScroll ? "eye" : "eye-off"}"></i>`;
+    renderIcons(scrollButton);
   });
   byId("clear-button").addEventListener("click", () => {
     state.events = [];
