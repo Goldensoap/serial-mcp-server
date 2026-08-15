@@ -6,6 +6,8 @@
 
 桌面端启动本机 TCP 代理（默认 `127.0.0.1:47832`）。代理独占真实串口；GUI、MCP stdio server 和 CLI 都是代理客户端。相同端口和相同参数的 `open` 是幂等操作，并返回同一个连接 ID。
 
+GUI、MCP 服务端或 CLI 中，最先成功绑定代理地址的进程会成为 broker owner。MCP 服务端先启动时，后启动的 GUI 会复用 MCP 进程内的 broker，并共享已有串口连接；GUI 先启动时则由 MCP 和 CLI 复用 GUI 的 broker。broker owner 退出会关闭 broker 及其持有的全部串口连接。此时已经运行的 GUI 不会自动接管或重启 broker，原连接状态也无法恢复；需要重启 GUI，或者启动一个持续运行的 MCP 服务端来重新建立 broker。为保持 broker 和串口连接稳定，推荐先启动 GUI，再让 MCP 客户端按需启动 MCP 服务端。GUI 和 MCP 都未运行时，单次 CLI 命令只会在该命令的进程生命周期内临时持有 broker。
+
 代理同时生成跨进程事件：
 
 - JSONL 日志：Windows 默认位于 `%LOCALAPPDATA%\serial-mcp-server\events.jsonl`。
@@ -35,6 +37,22 @@ npm run build
 ```powershell
 cargo check --manifest-path src-tauri/Cargo.toml --locked
 ```
+
+## MSI 打包
+
+```powershell
+cd gui
+npm install
+npm run tauri -- build --bundles msi
+```
+
+打包前置脚本会以 release 模式构建仓库根目录的 `serial-mcp-server`，并按 Tauri sidecar 命名规则复制产物。生成的 MSI 会把以下文件安装到同一个目录：
+
+- `serial-mcp-console.exe`：桌面 GUI。
+- `serial-mcp-server.exe`：CLI 与 MCP stdio 服务端。
+- `USAGE.md`：安装后使用说明。
+
+MSI 默认输出到 `src-tauri/target/release/bundle/msi/`。生成的 `src-tauri/binaries/` 是临时构建输出，不应提交。
 
 ## 验收流程
 
