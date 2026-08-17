@@ -21,6 +21,42 @@
                     Permanent="no"
                     System="yes" />
             </Component>
+
+            <Directory Id="CleanupSupportDir" Name=".uninstall">
+                <Component
+                    Id="CleanupRuntimeDataScript"
+                    Guid="CB2EDC3A-970E-4E36-9B4C-3E6D65A4C0F2"
+                    Win64="$(var.Win64)">
+                    <CreateFolder>
+                        <PermissionEx
+                            Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)" />
+                    </CreateFolder>
+                    <File
+                        Id="CleanupRuntimeDataScriptFile"
+                        Source="$(sys.SOURCEFILEDIR)cleanup-runtime-data.ps1"
+                        KeyPath="yes" />
+                    <RemoveFolder
+                        Id="RemoveCleanupSupportDir"
+                        Directory="CleanupSupportDir"
+                        On="uninstall" />
+                </Component>
+            </Directory>
         </DirectoryRef>
+
+        <CustomAction
+            Id="CleanupRuntimeData"
+            Directory="CleanupSupportDir"
+            ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[CleanupSupportDir]cleanup-runtime-data.ps1&quot; -InstallDirectory &quot;[INSTALLDIR].&quot;"
+            Execute="deferred"
+            Impersonate="no"
+            Return="check" />
+
+        <InstallExecuteSequence>
+            <Custom
+                Action="CleanupRuntimeData"
+                Before="RemoveFiles">
+                REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE
+            </Custom>
+        </InstallExecuteSequence>
     </Fragment>
 </Wix>

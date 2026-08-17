@@ -36,7 +36,8 @@
           "wix/path.wxs"
         ],
         "componentRefs": [
-          "AddInstallDirToPath"
+          "AddInstallDirToPath",
+          "CleanupRuntimeDataScript"
         ]
       }
     },
